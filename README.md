@@ -1,10 +1,6 @@
 # caddy-pro (cad)
 
 <p align="center">
-  <img src="https://avatars.githubusercontent.com/u/10706293?s=200&v=4" width="100" height="100" alt="Caddy Logo">
-</p>
-
-<p align="center">
   <b>极简、轻量、工业级高可靠的 Caddy 自动化反向代理交互式管理系统</b><br>
   为 Linux VPS 量身打造 | 支持语法预检、配置防丢失安全编辑、全自动 HTTPS、零额外内存常驻
 </p>
