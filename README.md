@@ -1,7 +1,7 @@
 # caddy-pro (cad)
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/caddyserver/dist/master/assets/icon/caddy.png" width="100" height="100" alt="Caddy Logo">
+  <img src="https://avatars.githubusercontent.com/u/10706293?s=200&v=4" width="100" height="100" alt="Caddy Logo">
 </p>
 
 <p align="center">
