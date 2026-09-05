@@ -1,4 +1,4 @@
-# caddy-pro (cad)
+<h1 align="center">caddy-pro (cad)</h1>
 
 <p align="center">
   <b>极简、轻量、工业级高可靠的 Caddy 自动化反向代理交互式管理系统</b><br>
