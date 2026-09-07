@@ -1,4 +1,5 @@
 *.bak
 *.tmp
+.cad_*
 .DS_Store
 

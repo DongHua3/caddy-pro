@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/bash-%3E%3D4.0-brightgreen.svg" alt="Bash">
-  <img src="https://img.shields.io/badge/version-v3.0.0-orange.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-v3.0.1-orange.svg" alt="Version">
   <img src="https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20RHEL%20%7C%20AlmaLinux%20%7C%20Alpine-lightgrey.svg" alt="Platform">
 </p>
 
@@ -47,11 +47,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/DongHua3/caddy-pro/main/cad.
 
 ---
 
-## 🖥️ 菜单功能一览 (v3.0.0)
+## 🖥️ 菜单功能一览 (v3.0.1)
 
 ```text
 ================================================================
-           caddy-pro 反向代理交互式管理系统 (v3.0.0)            
+           caddy-pro 反向代理交互式管理系统 (v3.0.1)            
        极简、安全、高可靠 | 快捷唤醒指令: cad
 ================================================================
   1. 查看当前所有反代规则列表
@@ -64,7 +64,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/DongHua3/caddy-pro/main/cad.
   8. 检查配置并平滑重载 Caddy (免重启生效)
   9. 手动编辑 Caddyfile 配置文件 (安全预检+草稿保护)
  10. 查看 Caddy 运行状态与证书日志
- 11. 重启 / 启动 / 停止 Caddy 服务
+ 11. 服务运维控制 (重载 / 重启 / 停止 / 启动)
  12. 一键安装 / 更新 Caddy 环境
   0. 退出管理系统
 ================================================================
@@ -79,6 +79,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/DongHua3/caddy-pro/main/cad.
 
 | 功能模块 | 亮点特性与架构升级 |
 | :--- | :--- |
+| **工业级权限中枢与防宕机守护** | 全局 `umask 022`，动态获取并适配 systemd Caddy 守护进程运行用户与属组（`root:group 0644`），消除 `caddy fmt` 导致的权限覆盖与 `permission denied` 错误；支持 SELinux 上下文修复；规则修改与启停采用同目录原子临时文件，配合 `awk` 退出码与非空双重门禁彻底防空灾；菜单 11 服务重启增加非破坏性语法门禁，严禁语法异常中断存量在线业务！ |
 | **AST 语法树深度解析** | 彻底弃用老旧行正则，采用花括号深度跟踪（Depth-Tracking）AWK 解析器。完美解析多行复杂嵌套指令（如带 `transport` 的后端配置），修复行首带 `/` 路径被误判丢弃的历史问题。 |
 | **统一绝对规则编号** | 在 **查看、修改、启停、删除** 所有操作中保持 100% 绝对一致的规则序号 `[1..N]`，彻底告别旧版菜单规则顺序错乱的问题。 |
 | **免 Nano 原位规则修改器 (Menu 3)** | 用户无需进入复杂的文本编辑器，在菜单中直接选择规则编号，即可交互式单项或组合修改 **域名、目标端口/地址、协议与TLS跳过验证、路径路由、启用状态**，外科手术式精准就地更新！ |

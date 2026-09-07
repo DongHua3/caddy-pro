@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  项目名称: caddy-pro (快捷指令: cad)
-#  版本编号: v3.0.0
+#  版本编号: v3.0.1
 #  版权所有: (c) 2026 DongHua3
 #  开源协议: MIT (SPDX-License-Identifier: MIT)
 #  项目定位: 极简、轻量、高可靠的 Caddy 反向代理交互式管理系统
@@ -9,12 +9,15 @@
 #            SSL Doctor网络体检、时光机快照回滚、双模CLI
 # ==============================================================================
 
+# 全局文件权限掩码声明 (确保默认生成文件为 0644，目录为 0755)
+umask 022
+
 CADDY_FILE="${CADDY_FILE:-/etc/caddy/Caddyfile}"
 CADDY_BAK="${CADDY_BAK:-/etc/caddy/Caddyfile.bak}"
 BACKUP_DIR="${BACKUP_DIR:-/etc/caddy/backups}"
 MAX_BACKUPS="${MAX_BACKUPS:-15}"
 INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/cad}"
-VERSION="3.0.0"
+VERSION="3.0.1"
 
 # 终端色彩定义
 RED='\033[0;31m'
@@ -59,20 +62,165 @@ check_root() {
     fi
 }
 
-# 2. 环境初始化检查
+# 2. 获取 Caddy 守护进程实际运行用户与属组
+get_caddy_user_group() {
+    local run_user=""
+    local run_group=""
+
+    if command -v systemctl >/dev/null 2>&1; then
+        run_user=$(systemctl show -p User --value caddy 2>/dev/null | tr -d '[:space:]')
+        run_group=$(systemctl show -p Group --value caddy 2>/dev/null | tr -d '[:space:]')
+    fi
+
+    # 若 systemd 单元未显式指定 User，检测系统中是否存在 caddy 用户，默认兜底为 root
+    if [ -z "$run_user" ]; then
+        if id caddy >/dev/null 2>&1; then
+            run_user="caddy"
+        else
+            run_user="root"
+        fi
+    fi
+
+    # 校验用户在系统中的真实存在性
+    if ! id "$run_user" >/dev/null 2>&1; then
+        run_user="root"
+    fi
+
+    # 若未指定 Group，优先提取运行用户主组或检测 caddy 组，默认兜底为 root
+    if [ -z "$run_group" ]; then
+        if [ "$run_user" != "root" ] && id -gn "$run_user" >/dev/null 2>&1; then
+            run_group=$(id -gn "$run_user" 2>/dev/null | tr -d '[:space:]')
+        elif getent group caddy >/dev/null 2>&1 || ( [ -f /etc/group ] && grep -q -E '^caddy:' /etc/group 2>/dev/null ); then
+            run_group="caddy"
+        else
+            run_group="root"
+        fi
+    fi
+
+    # 校验属组名称在系统中的真实存在性，不存在则安全降级为 root 组
+    local grp_ok=0
+    if command -v getent >/dev/null 2>&1; then
+        getent group "$run_group" >/dev/null 2>&1 && grp_ok=1
+    fi
+    if [ "$grp_ok" -eq 0 ] && [ -f /etc/group ]; then
+        grep -q -E "^${run_group}:" /etc/group 2>/dev/null && grp_ok=1
+    fi
+    if [ "$grp_ok" -eq 0 ]; then
+        run_group="root"
+    fi
+
+    echo "${run_user}:${run_group}"
+}
+
+# 3. 统一权限中枢 (动态计算真实父目录755 / 属主属组0644 / SELinux标签修复)
+ensure_caddyfile_perms() {
+    local target="${1:-$CADDY_FILE}"
+    local parent_dir
+    parent_dir="$(dirname "$target")"
+
+    # 动态计算真实父目录并确保 755 权限
+    if [ ! -d "$parent_dir" ]; then
+        mkdir -p "$parent_dir" 2>/dev/null || true
+    fi
+    chmod 755 "$parent_dir" 2>/dev/null || true
+
+    # 若目标为软链接，同步保障真实目标父目录的 755 穿透权限
+    local real_target="$target"
+    if [ -L "$target" ]; then
+        real_target=$(realpath "$target" 2>/dev/null || readlink -f "$target" 2>/dev/null || echo "$target")
+        local real_parent_dir
+        real_parent_dir="$(dirname "$real_target")"
+        if [ -d "$real_parent_dir" ]; then
+            chmod 755 "$real_parent_dir" 2>/dev/null || true
+        fi
+    fi
+
+    # 若文件不存在或为空则初始化标准配置 (确保具备非空内容以供快照备份与回滚)
+    if [ ! -e "$target" ]; then
+        echo "# caddy-pro" > "$target" 2>/dev/null || touch "$target" 2>/dev/null || true
+    fi
+
+    if [ -e "$target" ]; then
+        local ug run_group
+        ug=$(get_caddy_user_group)
+        run_group="${ug##*:}"
+
+        # 权限优先赋予 root:group 0644 (确保守护进程始终可读且 root 独占写权限)
+        if [ -n "$run_group" ] && [ "$run_group" != "root" ]; then
+            chown "root:${run_group}" "$target" 2>/dev/null || chown root:root "$target" 2>/dev/null || true
+        else
+            chown root:root "$target" 2>/dev/null || true
+        fi
+
+        chmod 644 "$target" 2>/dev/null || true
+
+        # 修复 RHEL/CentOS/Rocky 下 SELinux tmp_t 标签穿透导致的访问拒绝
+        restorecon -F "$target" 2>/dev/null || true
+        if [ "$real_target" != "$target" ] && [ -e "$real_target" ]; then
+            restorecon -F "$real_target" 2>/dev/null || true
+        fi
+    fi
+}
+
+# 4. 消除 root 校验假阳性：对 Caddy 运行用户进行只读穿透测试
+check_caddy_readable() {
+    local target="${1:-$CADDY_FILE}"
+    [ -e "$target" ] || return 1
+
+    local ug run_user
+    ug=$(get_caddy_user_group)
+    run_user="${ug%%:*}"
+
+    # 若运行用户为空或为 root，直接以当前权限判定
+    if [ -z "$run_user" ] || [ "$run_user" = "root" ]; then
+        [ -r "$target" ]
+        return $?
+    fi
+
+    # 以 Caddy 实际运行用户身份进行只读穿透探测 (绕开 root 的 DAC bypass 假阳性)
+    if id "$run_user" >/dev/null 2>&1; then
+        if command -v su >/dev/null 2>&1; then
+            su -s /bin/sh "$run_user" -c "test -r '$target'" >/dev/null 2>&1
+            return $?
+        elif command -v runuser >/dev/null 2>&1; then
+            runuser -u "$run_user" -s /bin/sh -- test -r "$target" >/dev/null 2>&1
+            return $?
+        fi
+    fi
+
+    [ -r "$target" ]
+    return $?
+}
+
+# 5. 环境初始化检查
 init_env() {
-    if [ ! -d "/etc/caddy" ]; then
-        mkdir -p /etc/caddy
-        chmod 755 /etc/caddy
+    local target_dir
+    target_dir="$(dirname "$CADDY_FILE")"
+    if [ ! -d "$target_dir" ]; then
+        mkdir -p "$target_dir" 2>/dev/null || true
     fi
+    chmod 755 "$target_dir" 2>/dev/null || true
+
     if [ ! -d "$BACKUP_DIR" ]; then
-        mkdir -p "$BACKUP_DIR"
-        chmod 700 "$BACKUP_DIR"
+        mkdir -p "$BACKUP_DIR" 2>/dev/null || true
     fi
-    if [ ! -f "$CADDY_FILE" ]; then
-        touch "$CADDY_FILE"
-        chmod 644 "$CADDY_FILE"
+    chmod 700 "$BACKUP_DIR" 2>/dev/null || true
+
+    # 若 Caddyfile 不存在或为空，注入合法占位注释保障首次添加规则时的回滚基线
+    if [ ! -s "$CADDY_FILE" ]; then
+        echo "# caddy-pro" > "$CADDY_FILE" 2>/dev/null || true
     fi
+    ensure_caddyfile_perms "$CADDY_FILE"
+
+    # 初始化备份配置基线
+    if [ ! -s "$CADDY_BAK" ]; then
+        cp -f "$CADDY_FILE" "$CADDY_BAK" 2>/dev/null || true
+        ensure_caddyfile_perms "$CADDY_BAK"
+    fi
+
+    # 清理历史异常中断可能残留的同目录临时文件
+    find "$target_dir" -maxdepth 1 -name '.cad_tmp.*' -delete 2>/dev/null || true
+    find "$target_dir" -maxdepth 1 -name '.cad_edit.*' -delete 2>/dev/null || true
 }
 
 # 3. 检查 Caddy 是否已安装门禁
@@ -135,11 +283,46 @@ create_backup() {
     fi
 }
 
-# 6. 安全重载与语法验证回滚机制 (全面涵盖语法静态预检 + 运行时重载失败紧急回滚)
+# 6. 安全重载与语法验证回滚机制 (排版规范 -> 统一赋权 -> 穿透测读 -> 静态预检 -> 运行时防中断重载)
 safe_reload() {
+    ensure_caddy_installed || return 1
     echo -e "${BLUE}正在执行 Caddyfile 语法安全预检...${PLAIN}"
 
-    # 静态语法预检
+    # 时序 1: 格式化排版先行落盘
+    caddy fmt --overwrite "$CADDY_FILE" > /dev/null 2>&1 || true
+
+    # 时序 2: 统一收口赋权 (目录 755 / 文件 644 / root:group / SELinux 标签)
+    ensure_caddyfile_perms "$CADDY_FILE"
+
+    # 时序 3: 消除 root 假阳性：对 Caddy 运行用户进行只读穿透测试
+    if ! check_caddy_readable "$CADDY_FILE"; then
+        local ug run_user
+        ug=$(get_caddy_user_group)
+        run_user="${ug%%:*}"
+        echo -e "${RED}✗ 权限穿透校验失败: Caddy 运行用户 [${run_user}] 无法读取配置文件 [${CADDY_FILE}]！${PLAIN}"
+        if [ -f "$CADDY_BAK" ] && [ -s "$CADDY_BAK" ]; then
+            echo -e "${YELLOW}正在尝试回滚至上一次正常运行的备份配置...${PLAIN}"
+            cp -f "$CADDY_BAK" "$CADDY_FILE"
+            ensure_caddyfile_perms "$CADDY_FILE"
+            if systemctl is-active --quiet caddy 2>/dev/null; then
+                if systemctl reload caddy > /dev/null 2>&1 || systemctl restart caddy > /dev/null 2>&1; then
+                    echo -e "${GREEN}✓ 已安全回滚至上一备份配置并恢复服务。${PLAIN}"
+                else
+                    echo -e "${RED}✗ 严重: 权限异常导致回滚重载/重启依然失败！Caddy 服务状态异常！${PLAIN}"
+                    systemctl status caddy --no-pager 2>/dev/null
+                    journalctl -u caddy -n 30 --no-pager 2>/dev/null
+                    return 1
+                fi
+            else
+                echo -e "${YELLOW}提示: 配置已成功回滚至备份，但 Caddy 服务当前处于停止状态。${PLAIN}"
+            fi
+        else
+            echo -e "${RED}[错误] 未找到可用的有效备份配置 ($CADDY_BAK)，无法执行回滚！${PLAIN}"
+        fi
+        return 1
+    fi
+
+    # 时序 4: 静态语法预检 (严格校验已排版且赋权的落盘配置文件)
     if ! caddy validate --config "$CADDY_FILE" > /dev/null 2>&1; then
         echo -e "${RED}✗ 配置文件语法校验未通过！错误诊断信息如下：${PLAIN}"
         caddy validate --config "$CADDY_FILE"
@@ -147,33 +330,49 @@ safe_reload() {
             echo -e "${YELLOW}正在自动回滚至上一次正常运行的配置...${PLAIN}"
             cp -f "$CADDY_BAK" "$CADDY_FILE"
             caddy fmt --overwrite "$CADDY_FILE" > /dev/null 2>&1 || true
+            ensure_caddyfile_perms "$CADDY_FILE"
             if systemctl is-active --quiet caddy 2>/dev/null; then
-                systemctl reload caddy > /dev/null 2>&1 || true
+                if systemctl reload caddy > /dev/null 2>&1 || systemctl restart caddy > /dev/null 2>&1; then
+                    echo -e "${GREEN}✓ 已成功自动回滚，现有代理业务未受任何中断！${PLAIN}"
+                else
+                    echo -e "${RED}✗ 严重: 自动回滚重载/重启依然失败！Caddy 服务状态异常！${PLAIN}"
+                    systemctl status caddy --no-pager 2>/dev/null
+                    journalctl -u caddy -n 30 --no-pager 2>/dev/null
+                    return 1
+                fi
+            else
+                echo -e "${YELLOW}提示: 配置已成功回滚至备份，但 Caddy 服务当前处于停止状态。${PLAIN}"
             fi
-            echo -e "${GREEN}✓ 已成功自动回滚，现有代理业务未受任何中断！${PLAIN}"
         else
-            echo -e "${YELLOW}提示: 未找到可用的有效备份配置 ($CADDY_BAK)，无法自动回滚。${PLAIN}"
+            echo -e "${RED}[错误] 未找到可用的有效备份配置 ($CADDY_BAK)，无法自动回滚！${PLAIN}"
         fi
         return 1
     fi
 
-    # 规范化排版
-    caddy fmt --overwrite "$CADDY_FILE" > /dev/null 2>&1 || true
-
-    # 运行时重载 / 启动验证与防中断回滚
+    # 时序 5: 运行时重载 / 启动验证与防中断回滚
     if systemctl is-active --quiet caddy 2>/dev/null; then
         if systemctl reload caddy; then
             echo -e "${GREEN}✓ 语法验证通过，配置已平滑重载生效！${PLAIN}"
             cp -f "$CADDY_FILE" "$CADDY_BAK" 2>/dev/null || true
+            ensure_caddyfile_perms "$CADDY_BAK"
             return 0
         else
             echo -e "${RED}✗ Caddy 运行时平滑重载失败！详细运行日志如下：${PLAIN}"
-            journalctl -u caddy -n 15 --no-pager 2>/dev/null
+            journalctl -u caddy -n 30 --no-pager 2>/dev/null
             if [ -f "$CADDY_BAK" ] && [ -s "$CADDY_BAK" ]; then
                 echo -e "${YELLOW}正在紧急执行安全回滚以恢复原有正常配置...${PLAIN}"
                 cp -f "$CADDY_BAK" "$CADDY_FILE"
-                systemctl reload caddy > /dev/null 2>&1 || systemctl restart caddy > /dev/null 2>&1 || true
-                echo -e "${GREEN}✓ 已安全回滚至上一稳定状态，已解除潜在服务中断！${PLAIN}"
+                ensure_caddyfile_perms "$CADDY_FILE"
+                if systemctl reload caddy > /dev/null 2>&1 || systemctl restart caddy > /dev/null 2>&1; then
+                    echo -e "${GREEN}✓ 已安全回滚至上一稳定状态，已解除潜在服务中断！${PLAIN}"
+                else
+                    echo -e "${RED}✗ 严重: 紧急回滚重载/重启依然失败！Caddy 处于异常状态！${PLAIN}"
+                    systemctl status caddy --no-pager 2>/dev/null
+                    journalctl -u caddy -n 30 --no-pager 2>/dev/null
+                    return 1
+                fi
+            else
+                echo -e "${RED}[错误] 未找到可用的有效备份配置 ($CADDY_BAK)，无法执行回滚！${PLAIN}"
             fi
             return 1
         fi
@@ -182,14 +381,25 @@ safe_reload() {
         if systemctl restart caddy; then
             echo -e "${GREEN}✓ Caddy 服务已成功启动生效！${PLAIN}"
             cp -f "$CADDY_FILE" "$CADDY_BAK" 2>/dev/null || true
+            ensure_caddyfile_perms "$CADDY_BAK"
             return 0
         else
             echo -e "${RED}✗ Caddy 启动运行时失败！详细系统日志如下：${PLAIN}"
-            journalctl -u caddy -n 15 --no-pager 2>/dev/null
+            journalctl -u caddy -n 30 --no-pager 2>/dev/null
             if [ -f "$CADDY_BAK" ] && [ -s "$CADDY_BAK" ]; then
                 echo -e "${YELLOW}正在撤销导致启动失败的配置变更...${PLAIN}"
                 cp -f "$CADDY_BAK" "$CADDY_FILE"
-                echo -e "${GREEN}✓ 已恢复原配置！${PLAIN}"
+                ensure_caddyfile_perms "$CADDY_FILE"
+                if systemctl restart caddy > /dev/null 2>&1; then
+                    echo -e "${GREEN}✓ 已恢复原配置并成功启动 Caddy！${PLAIN}"
+                else
+                    echo -e "${RED}✗ 严重: 恢复原配置后启动 Caddy 依然失败！${PLAIN}"
+                    systemctl status caddy --no-pager 2>/dev/null
+                    journalctl -u caddy -n 30 --no-pager 2>/dev/null
+                    return 1
+                fi
+            else
+                echo -e "${RED}[错误] 未找到可用的有效备份配置 ($CADDY_BAK)，无法执行回滚！${PLAIN}"
             fi
             return 1
         fi
@@ -540,7 +750,12 @@ $new_domain {
 RULE
     fi
 
-    safe_reload
+    ensure_caddyfile_perms "$CADDY_FILE"
+    if safe_reload; then
+        echo -e "\n${GREEN}✓ 规则 [${new_domain}] 添加成功并已生效！${PLAIN}"
+    else
+        echo -e "\n${RED}✗ 规则 [${new_domain}] 添加生效失败，已自动回滚。${PLAIN}"
+    fi
     pause
 }
 
@@ -570,12 +785,16 @@ update_rule_block() {
         fi
     fi
 
+    local target_dir
+    target_dir="$(dirname "$target_file")"
+    [ -d "$target_dir" ] || mkdir -p "$target_dir" 2>/dev/null || true
+
     local rp_file
-    rp_file=$(mktemp /tmp/cad_rp.XXXXXX)
+    rp_file=$(mktemp "${target_dir}/.cad_tmp.rp.XXXXXX") || { echo -e "${RED}[错误] 无法创建临时规则文件！${PLAIN}"; return 1; }
     echo "$rp_content" > "$rp_file"
 
     local out_file
-    out_file=$(mktemp /tmp/cad_out.XXXXXX)
+    out_file=$(mktemp "${target_dir}/.cad_tmp.out.XXXXXX") || { rm -f "$rp_file"; echo -e "${RED}[错误] 无法创建临时输出文件！${PLAIN}"; return 1; }
 
     awk -v s="$s_line" -v e="$e_line" \
         -v nd="$new_domain" \
@@ -660,9 +879,20 @@ update_rule_block() {
         print_line(line)
     }
     ' "$target_file" > "$out_file"
+    local awk_status=$?
 
-    mv -f "$out_file" "$target_file"
     rm -f "$rp_file"
+
+    # 防灾校验：严格非空与执行状态检查，严禁空配置或转换异常覆盖生产文件
+    if [ $awk_status -eq 0 ] && [ -s "$out_file" ]; then
+        mv -f "$out_file" "$target_file"
+        ensure_caddyfile_perms "$target_file"
+        return 0
+    else
+        echo -e "${RED}[错误] 配置生成异常 (转换失败或输出文件为空)，已拦截写入以防破坏生产配置！${PLAIN}"
+        rm -f "$out_file"
+        return 1
+    fi
 }
 
 # 菜单 3: 交互式原位修改反代规则 (Zero-Nano In-Place Modifier)
@@ -887,7 +1117,11 @@ toggle_rule() {
         read -p "确认停用规则 [$target_domain] 吗? (y/n): " confirm
         if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
             create_backup "停用规则: ${target_domain}"
-            local tmp="${CADDY_FILE}.tmp"
+            local target_dir
+            target_dir="$(dirname "$CADDY_FILE")"
+            local out_file
+            out_file=$(mktemp "${target_dir}/.cad_tmp.XXXXXX") || { echo -e "${RED}[错误] 无法创建临时文件！${PLAIN}"; pause; return 1; }
+
             awk -v s="$s_line" -v e="$e_line" '
             NR >= s && NR <= e {
                 if ($0 !~ /^[ \t]*#[ \t]*\[cad:disabled\]/) {
@@ -896,16 +1130,32 @@ toggle_rule() {
                 }
             }
             { print $0 }
-            ' "$CADDY_FILE" > "$tmp" && mv -f "$tmp" "$CADDY_FILE"
+            ' "$CADDY_FILE" > "$out_file"
+            local awk_status=$?
 
-            echo -e "${GREEN}规则 [$target_domain] 已设置为停用状态！${PLAIN}"
-            safe_reload
+            # 防灾校验：严格非空与执行状态检查
+            if [ $awk_status -eq 0 ] && [ -s "$out_file" ]; then
+                mv -f "$out_file" "$CADDY_FILE"
+                ensure_caddyfile_perms "$CADDY_FILE"
+                if safe_reload; then
+                    echo -e "\n${GREEN}✓ 规则 [$target_domain] 已设置为停用状态！${PLAIN}"
+                else
+                    echo -e "\n${RED}✗ 停用规则生效失败，已自动回滚。${PLAIN}"
+                fi
+            else
+                echo -e "${RED}[错误] 停用规则异常 (生成文件为空或转换失败)，已拦截写入以保护生产配置！${PLAIN}"
+                rm -f "$out_file"
+            fi
         fi
     else
         read -p "确认重新启用规则 [$target_domain] 吗? (y/n): " confirm
         if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
             create_backup "启用规则: ${target_domain}"
-            local tmp="${CADDY_FILE}.tmp"
+            local target_dir
+            target_dir="$(dirname "$CADDY_FILE")"
+            local out_file
+            out_file=$(mktemp "${target_dir}/.cad_tmp.XXXXXX") || { echo -e "${RED}[错误] 无法创建临时文件！${PLAIN}"; pause; return 1; }
+
             awk -v s="$s_line" -v e="$e_line" '
             NR >= s && NR <= e {
                 line = $0
@@ -914,10 +1164,22 @@ toggle_rule() {
                 next
             }
             { print $0 }
-            ' "$CADDY_FILE" > "$tmp" && mv -f "$tmp" "$CADDY_FILE"
+            ' "$CADDY_FILE" > "$out_file"
+            local awk_status=$?
 
-            echo -e "${GREEN}规则 [$target_domain] 已重新启用！${PLAIN}"
-            safe_reload
+            # 防灾校验：严格非空与执行状态检查
+            if [ $awk_status -eq 0 ] && [ -s "$out_file" ]; then
+                mv -f "$out_file" "$CADDY_FILE"
+                ensure_caddyfile_perms "$CADDY_FILE"
+                if safe_reload; then
+                    echo -e "\n${GREEN}✓ 规则 [$target_domain] 已重新启用！${PLAIN}"
+                else
+                    echo -e "\n${RED}✗ 启用规则生效失败，已自动回滚。${PLAIN}"
+                fi
+            else
+                echo -e "${RED}[错误] 启用规则异常 (生成文件为空或转换失败)，已拦截写入以保护生产配置！${PLAIN}"
+                rm -f "$out_file"
+            fi
         fi
     fi
     pause
@@ -956,14 +1218,35 @@ del_rule() {
     read -p "确认彻底删除 [$target_del] 的反向代理配置吗? (y/n): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         create_backup "删除规则: ${target_del}"
-        local tmp="${CADDY_FILE}.tmp"
+        local target_dir
+        target_dir="$(dirname "$CADDY_FILE")"
+        local out_file
+        out_file=$(mktemp "${target_dir}/.cad_tmp.XXXXXX") || { echo -e "${RED}[错误] 无法创建临时文件！${PLAIN}"; pause; return 1; }
+
         awk -v s="$s_line" -v e="$e_line" '
         NR >= s && NR <= e { next }
         { print $0 }
-        ' "$CADDY_FILE" > "$tmp" && mv -f "$tmp" "$CADDY_FILE"
+        ' "$CADDY_FILE" > "$out_file"
+        local awk_status=$?
 
-        echo -e "${GREEN}已成功删除 [$target_del]！${PLAIN}"
-        safe_reload
+        # 若删除的是唯一规则导致输出为空或仅剩空白字符，写入标准占位注释以防空文件
+        if [ "$RULE_TOTAL" -eq 1 ] && ! grep -q '[^[:space:]]' "$out_file" 2>/dev/null; then
+            echo "# caddy-pro" > "$out_file"
+        fi
+
+        # 防灾校验：严格非空与执行状态检查
+        if [ $awk_status -eq 0 ] && [ -s "$out_file" ]; then
+            mv -f "$out_file" "$CADDY_FILE"
+            ensure_caddyfile_perms "$CADDY_FILE"
+            if safe_reload; then
+                echo -e "\n${GREEN}✓ 已成功删除 [$target_del]！${PLAIN}"
+            else
+                echo -e "\n${RED}✗ 删除规则生效失败，已自动回滚。${PLAIN}"
+            fi
+        else
+            echo -e "${RED}[错误] 删除规则异常 (生成文件为空或转换失败)，已拦截写入以保护生产配置！${PLAIN}"
+            rm -f "$out_file"
+        fi
     else
         echo "操作已取消。"
     fi
@@ -1339,6 +1622,7 @@ rollback_snapshot() {
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         create_backup "回滚前系统自动备份"
         cp -f "$target_snap" "$CADDY_FILE"
+        ensure_caddyfile_perms "$CADDY_FILE"
         if safe_reload; then
             echo -e "\n${GREEN}✓ 已成功回滚至所选快照版本，配置已生效！${PLAIN}"
         else
@@ -1352,8 +1636,10 @@ rollback_snapshot() {
 # 菜单 9: 手动安全编辑 (临时文件 + 语法预检 + 草稿安全保护)
 edit_caddyfile() {
     ensure_caddy_installed || return 1
+    local target_dir
+    target_dir="$(dirname "$CADDY_FILE")"
     local tmp_file
-    tmp_file=$(mktemp /tmp/caddyfile.XXXXXX) || { echo -e "${RED}无法创建临时工作文件！${PLAIN}"; pause; return 1; }
+    tmp_file=$(mktemp "${target_dir}/.cad_edit.XXXXXX") || { echo -e "${RED}无法创建临时工作文件！${PLAIN}"; pause; return 1; }
     cp -f "$CADDY_FILE" "$tmp_file"
 
     local editor="${EDITOR:-${VISUAL:-nano}}"
@@ -1365,12 +1651,11 @@ edit_caddyfile() {
         if caddy validate --config "$tmp_file" >/dev/null 2>&1; then
             create_backup "手动编辑前备份"
             cp -f "$tmp_file" "$CADDY_FILE"
-            chmod 644 "$CADDY_FILE"
-            caddy fmt --overwrite "$CADDY_FILE" >/dev/null 2>&1
+            ensure_caddyfile_perms "$CADDY_FILE"
             if safe_reload; then
                 echo -e "${GREEN}✓ 语法验证通过，配置已保存并平滑重载！${PLAIN}"
             else
-                local draft="/etc/caddy/Caddyfile.draft.$(date +%s)"
+                local draft="${target_dir}/Caddyfile.draft.$(date +%s)"
                 cp -f "$tmp_file" "$draft" 2>/dev/null || true
                 echo -e "${YELLOW}提示: 运行时生效失败（已自动回滚），您编辑的草稿已暂存至: $draft${PLAIN}"
             fi
@@ -1386,8 +1671,8 @@ edit_caddyfile() {
                     break
                     ;;
                 s)
-                    local draft="/etc/caddy/Caddyfile.draft.$(date +%s)"
-                    cp -f "$tmp_file" "$draft"
+                    local draft="${target_dir}/Caddyfile.draft.$(date +%s)"
+                    cp -f "$tmp_file" "$draft" 2>/dev/null || true
                     echo -e "${YELLOW}草稿已保存在: $draft，原配置未做修改。${PLAIN}"
                     break
                     ;;
@@ -1406,6 +1691,84 @@ view_logs() {
     echo -e "\n${YELLOW}====================== Caddy 实时运行与 SSL 证书日志 (最新 40 行) ======================${PLAIN}"
     journalctl -u caddy -n 40 --no-pager
     pause
+}
+
+# 菜单 11: 服务运维控制 (重载 / 重启 / 停止 / 启动)
+service_control() {
+    echo -e "\n${YELLOW}请选择服务运维动作：${PLAIN}"
+    echo -e "  1. 平滑重载 (Reload - 语法预检通过后平滑重载)"
+    echo -e "  2. 重启服务 (Restart - 语法校验安全拦截后重启)"
+    echo -e "  3. 停止服务 (Stop)"
+    echo -e "  4. 启动服务 (Start)"
+    echo -e "  0. 返回主菜单"
+    read -p "请输入选项 [0-4]: " s_opt
+    case $s_opt in
+        1)
+            ensure_caddy_installed || { pause; return 1; }
+            echo -e "${BLUE}正在执行配置平滑重载...${PLAIN}"
+            safe_reload
+            pause
+            ;;
+        2)
+            ensure_caddy_installed || { pause; return 1; }
+            ensure_caddyfile_perms "$CADDY_FILE"
+            echo -e "${BLUE}正在执行配置语法安全预检以保护存量业务...${PLAIN}"
+            if ! caddy validate --config "$CADDY_FILE" >/dev/null 2>&1; then
+                echo -e "${RED}✗ 配置文件语法校验未通过！已拦截重启操作以保护在线业务不受中断！${PLAIN}"
+                caddy validate --config "$CADDY_FILE"
+                echo -e "${YELLOW}建议: 请在主菜单选择 [3] 或 [9] 修正配置后再尝试重启。${PLAIN}"
+            else
+                echo -e "${GREEN}✓ 语法预检通过，正在重启 Caddy 服务...${PLAIN}"
+                if systemctl restart caddy; then
+                    echo -e "${GREEN}✓ Caddy 服务重启成功！${PLAIN}"
+                else
+                    echo -e "\n${RED}✗ Caddy 重启失败！${PLAIN}"
+                    echo -e "${YELLOW}--- systemctl status caddy ---${PLAIN}"
+                    systemctl status caddy --no-pager 2>/dev/null
+                    echo -e "${YELLOW}--- journalctl -u caddy -n 30 ---${PLAIN}"
+                    journalctl -u caddy -n 30 --no-pager 2>/dev/null
+                    echo -e "${YELLOW}提示: 您可在主菜单选择 [6] 检查端口冲突，或选择 [10] 查看详细日志。${PLAIN}"
+                fi
+            fi
+            pause
+            ;;
+        3)
+            echo -e "${BLUE}正在停止 Caddy 服务...${PLAIN}"
+            if systemctl stop caddy; then
+                echo -e "${YELLOW}✓ Caddy 服务已成功停止！${PLAIN}"
+            else
+                echo -e "\n${RED}✗ Caddy 停止失败！${PLAIN}"
+                echo -e "${YELLOW}--- systemctl status caddy ---${PLAIN}"
+                systemctl status caddy --no-pager 2>/dev/null
+                echo -e "${YELLOW}--- journalctl -u caddy -n 30 ---${PLAIN}"
+                journalctl -u caddy -n 30 --no-pager 2>/dev/null
+            fi
+            pause
+            ;;
+        4)
+            ensure_caddy_installed || { pause; return 1; }
+            ensure_caddyfile_perms "$CADDY_FILE"
+            echo -e "${BLUE}正在启动 Caddy 服务...${PLAIN}"
+            if systemctl start caddy; then
+                echo -e "${GREEN}✓ Caddy 服务启动成功！${PLAIN}"
+            else
+                echo -e "\n${RED}✗ Caddy 启动失败！${PLAIN}"
+                echo -e "${YELLOW}--- systemctl status caddy ---${PLAIN}"
+                systemctl status caddy --no-pager 2>/dev/null
+                echo -e "${YELLOW}--- journalctl -u caddy -n 30 ---${PLAIN}"
+                journalctl -u caddy -n 30 --no-pager 2>/dev/null
+                echo -e "${YELLOW}提示: 您可在主菜单选择 [6] 检查 80/443 端口冲突，或选择 [8] 检查配置语法。${PLAIN}"
+            fi
+            pause
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            echo -e "${RED}无效操作选项。${PLAIN}"
+            pause
+            ;;
+    esac
 }
 
 # 菜单 12: Caddy 一键安装模块
@@ -1454,6 +1817,8 @@ install_caddy() {
     fi
 
     if command -v caddy > /dev/null 2>&1; then
+        init_env
+        ensure_caddyfile_perms "$CADDY_FILE"
         systemctl enable caddy > /dev/null 2>&1
         systemctl restart caddy > /dev/null 2>&1
         echo -e "\n${GREEN}✓ Caddy 安装成功并已设置开机自启！版本: $(caddy version | awk '{print $1}')${PLAIN}"
@@ -1544,7 +1909,7 @@ main_menu() {
         echo -e "  ${GREEN}8.${PLAIN} 检查配置并平滑重载 Caddy (免重启生效)"
         echo -e "  ${GREEN}9.${PLAIN} 手动编辑 Caddyfile 配置文件 (安全预检+草稿保护)"
         echo -e " ${GREEN}10.${PLAIN} 查看 Caddy 运行状态与证书日志"
-        echo -e " ${GREEN}11.${PLAIN} 重启 / 启动 / 停止 Caddy 服务"
+        echo -e " ${GREEN}11.${PLAIN} 服务运维控制 (重载 / 重启 / 停止 / 启动)"
         echo -e " ${GREEN}12.${PLAIN} 一键安装 / 更新 Caddy 环境"
         echo -e "  ${GREEN}0.${PLAIN} 退出管理系统"
         echo -e "${BLUE}================================================================${PLAIN}"
@@ -1602,15 +1967,7 @@ main_menu() {
                 view_logs
                 ;;
             11)
-                echo -e "\n${YELLOW}请选择服务动作：1. 重启  2. 停止  3. 启动${PLAIN}"
-                read -p "输入选项 [1-3]: " s_opt
-                case $s_opt in
-                    1) systemctl restart caddy && echo -e "${GREEN}Caddy 重启成功！${PLAIN}" ;;
-                    2) systemctl stop caddy && echo -e "${YELLOW}Caddy 已停止！${PLAIN}" ;;
-                    3) systemctl start caddy && echo -e "${GREEN}Caddy 启动成功！${PLAIN}" ;;
-                    *) echo "无效操作。" ;;
-                esac
-                pause
+                service_control
                 ;;
             12)
                 install_caddy
