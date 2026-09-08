@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  项目名称: caddy-pro (快捷指令: cad)
-#  版本编号: v3.0.1
+#  版本编号: v3.1.0
 #  版权所有: (c) 2026 DongHua3
 #  开源协议: MIT (SPDX-License-Identifier: MIT)
 #  项目定位: 极简、轻量、高可靠的 Caddy 反向代理交互式管理系统
@@ -17,7 +17,7 @@ CADDY_BAK="${CADDY_BAK:-/etc/caddy/Caddyfile.bak}"
 BACKUP_DIR="${BACKUP_DIR:-/etc/caddy/backups}"
 MAX_BACKUPS="${MAX_BACKUPS:-15}"
 INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/cad}"
-VERSION="3.0.1"
+VERSION="3.1.0"
 
 # 终端色彩定义
 RED='\033[0;31m'
@@ -1447,7 +1447,12 @@ run_ssl_doctor() {
                 echo -e "  ${GREEN}✓ IPv4 DNS 解析与本机公网 IP 一致！Let's Encrypt / ZeroSSL 验证可直接通过。${PLAIN}"
             else
                 echo -e "  ${RED}✗ 域名解析 IP ($dns_v4) 与本机 IP ($server_v4) 不匹配！${PLAIN}"
-                echo -e "  ${YELLOW}建议: 请检查 DNS 服务商控制台的 A 记录设置，或等待 DNS 缓存生效。${PLAIN}"
+                if is_cf_dns_active; then
+                    echo -e "  ${GREEN}⚡ [DNS-01 引擎生效中] 检测到已激活 Cloudflare DNS-01 验证！即使域名解析至中转机/NAT小鸡，证书亦可通过 DNS TXT 记录直签，无需直连本机！${PLAIN}"
+                else
+                    echo -e "  ${YELLOW}建议: 请检查 DNS 服务商控制台的 A 记录设置，或等待 DNS 缓存生效。${PLAIN}"
+                    echo -e "  ${BLUE}💡 若这是中转机/NAT小鸡架构，推荐进入「菜单 6」开启 Cloudflare DNS-01 验证，彻底解除 IP 必须直连本机的限制！${PLAIN}"
+                fi
             fi
         else
             echo -e "  ${YELLOW}ℹ 无法完成完整匹配比对 (DNS 或本机 IP 缺失)。${PLAIN}"
@@ -1468,10 +1473,16 @@ run_ssl_doctor() {
 
         if [ "$is_cf" -eq 1 ]; then
             echo -e "  ${YELLOW}⚠️  检测到该域名开启了 Cloudflare 小黄云 (CDN 代理模式)！${PLAIN}"
-            echo -e "  ${BLUE}【SSL 证书签发避坑指南】${PLAIN}"
-            echo -e "  1. 开启小黄云后，HTTP-01 验证请求会被 Cloudflare 边缘节点代理拦截；"
-            echo -e "  2. 推荐做法: 在 Cloudflare 面板将该记录临时切为 '仅限 DNS (灰色云朵)'，待证书签发成功后再开启小黄云；"
-            echo -e "  3. 并在 Cloudflare 控制台中将 SSL/TLS 加密模式设置为 'Full' (完全) 或 'Strict' (严格)。"
+            if is_cf_dns_active; then
+                echo -e "  ${GREEN}✓ [DNS-01 引擎已就绪] 已检测到生效中的 Cloudflare DNS-01 验证！${PLAIN}"
+                echo -e "  ${GREEN}  即便开启小黄云代理模式，亦可无视边缘拦截正常完成证书签发与自动续期，无需切为灰色云朵！${PLAIN}"
+            else
+                echo -e "  ${BLUE}【SSL 证书签发避坑指南】${PLAIN}"
+                echo -e "  1. 开启小黄云后，HTTP-01 验证请求会被 Cloudflare 边缘节点代理拦截；"
+                echo -e "  2. 传统做法: 在 Cloudflare 面板将该记录临时切为 '仅限 DNS (灰色云朵)'，待证书签发成功后再开启小黄云；"
+                echo -e "  3. 并在 Cloudflare 控制台中将 SSL/TLS 加密模式设置为 'Full' (完全) 或 'Strict' (严格)；"
+                echo -e "  4. ${GREEN}${BOLD}终极方案${PLAIN}: 使用「菜单 6」一键配置 Cloudflare DNS-01，零手动操作、永久无视小黄云拦截！"
+            fi
         else
             echo -e "  ${GREEN}✓ 未检测到 Cloudflare CDN 代理拦截，外部请求直连本服务器。${PLAIN}"
         fi
@@ -1483,6 +1494,9 @@ run_ssl_doctor() {
     # 4. 端口 80 / 443 冲突检测
     echo -e "\n${YELLOW}[4/4] Web 核心端口 (80/443) 冲突检测:${PLAIN}"
     check_port_conflicts
+    if is_cf_dns_active; then
+        echo -e "  ${GREEN}ℹ [提示] 当前处于 Cloudflare DNS-01 模式，证书申请与续期完全不依赖 80/443 入站端口连接。${PLAIN}"
+    fi
     echo -e "${BLUE}=======================================================================${PLAIN}"
 }
 
@@ -1520,6 +1534,655 @@ ssl_doctor() {
     check_domain=$(echo "$check_domain" | tr -d '[:space:]')
     run_ssl_doctor "$check_domain"
     pause
+}
+
+# ==============================================================================
+#  Cloudflare DNS-01 ACME 自动化引擎模块 (v3.1.0 核心扩展)
+# ==============================================================================
+
+# 检测 Caddy 二进制适用的 CPU 架构标识
+detect_caddy_arch() {
+    local m
+    m=$(uname -m)
+    case "$m" in
+        x86_64|amd64)   echo "amd64" ;;
+        aarch64|arm64)  echo "arm64" ;;
+        armv7l|armhf)   echo "arm" ;;
+        riscv64)        echo "riscv64" ;;
+        s390x)          echo "s390x" ;;
+        *)              echo "amd64" ;;
+    esac
+}
+
+# 检查当前 Caddy 是否集成了 Cloudflare DNS 插件模块
+has_cf_dns_module() {
+    command -v caddy >/dev/null 2>&1 || return 1
+    caddy list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'
+}
+
+# 从 Caddyfile 全局配置块中解析已配置的 Cloudflare API Token
+get_cf_dns_token() {
+    [ ! -f "$CADDY_FILE" ] && return 1
+    awk '
+    function count_char(str, ch,   c, i, L) {
+        c = 0; L = length(str)
+        for (i = 1; i <= L; i++) if (substr(str, i, 1) == ch) c++
+        return c
+    }
+    BEGIN { in_global = 0; depth = 0; token = "" }
+    {
+        raw = $0
+        line = raw
+        sub(/^[ \t]+/, "", line)
+        if (depth == 0) {
+            if (line ~ /^\{/) {
+                in_global = 1
+                open_c = count_char(line, "{")
+                close_c = count_char(line, "}")
+                depth = open_c - close_c
+                if (line ~ /acme_dns[ \t]+cloudflare/) {
+                    t = line
+                    sub(/.*acme_dns[ \t]+cloudflare[ \t]+/, "", t)
+                    sub(/[ \t\}].*$/, "", t)
+                    token = t
+                }
+                if (depth <= 0) in_global = 0
+            }
+        } else if (in_global) {
+            open_c = count_char(line, "{")
+            close_c = count_char(line, "}")
+            depth += (open_c - close_c)
+            if (line ~ /acme_dns[ \t]+cloudflare/) {
+                t = line
+                sub(/^[ \t]*acme_dns[ \t]+cloudflare[ \t]+/, "", t)
+                sub(/[ \t\}].*$/, "", t)
+                token = t
+            }
+            if (depth <= 0) in_global = 0
+        }
+    }
+    END {
+        if (token != "") {
+            gsub(/["\047\r]/, "", token)
+            print token
+            exit 0
+        }
+        exit 1
+    }
+    ' "$CADDY_FILE"
+}
+
+# 判断 Caddyfile 中是否配置了 Cloudflare Token
+has_cf_dns_token() {
+    local t
+    t=$(get_cf_dns_token 2>/dev/null)
+    [ -n "$t" ]
+}
+
+# 判断 Cloudflare DNS-01 ACME 引擎是否处于完全就绪并生效状态
+is_cf_dns_active() {
+    has_cf_dns_module && has_cf_dns_token
+}
+
+# 写入或就地更新 Caddyfile 全局配置块中的 Cloudflare API Token
+apply_cf_dns_token() {
+    local target_file="$1"
+    local token="$2"
+    local target_dir
+    target_dir=$(dirname "$target_file")
+    local tmp_file
+    tmp_file=$(mktemp "${target_dir}/.cad_tmp.XXXXXX" 2>/dev/null) || tmp_file="${target_file}.tmp.$$"
+
+    local has_global
+    has_global=$(awk '
+    BEGIN { found = 0; depth = 0 }
+    {
+        line = $0
+        sub(/^[ \t]+/, "", line)
+        if (depth == 0) {
+            if (line ~ /^\{/) {
+                found = 1
+                exit 0
+            } else if (line ~ /^[a-zA-Z0-9_.*:-]+.*\{/) {
+                exit 1
+            }
+        }
+    }
+    END { if (!found) exit 1 }
+    ' "$target_file" && echo "1" || echo "0")
+
+    if [ "$has_global" == "1" ]; then
+        awk -v token="$token" '
+        function count_char(str, ch,   c, i, L) {
+            c = 0; L = length(str)
+            for (i = 1; i <= L; i++) if (substr(str, i, 1) == ch) c++
+            return c
+        }
+        BEGIN { in_global = 0; depth = 0; replaced = 0 }
+        {
+            raw = $0
+            line = raw
+            sub(/^[ \t]+/, "", line)
+            if (depth == 0 && !replaced) {
+                if (line ~ /^\{/) {
+                    in_global = 1
+                    open_c = count_char(line, "{")
+                    close_c = count_char(line, "}")
+                    depth = open_c - close_c
+                    if (depth <= 0) {
+                        print "{\n    acme_dns cloudflare " token "\n}"
+                        replaced = 1
+                        in_global = 0
+                        next
+                    }
+                    print raw
+                    next
+                }
+            } else if (in_global) {
+                open_c = count_char(line, "{")
+                close_c = count_char(line, "}")
+                depth += (open_c - close_c)
+                if (line ~ /^[ \t]*acme_dns[ \t]+cloudflare/) {
+                    print "    acme_dns cloudflare " token
+                    replaced = 1
+                    next
+                }
+                if (depth <= 0) {
+                    if (!replaced) {
+                        print "    acme_dns cloudflare " token
+                        replaced = 1
+                    }
+                    in_global = 0
+                    print raw
+                    next
+                }
+            }
+            print raw
+        }
+        ' "$target_file" > "$tmp_file"
+    else
+        {
+            echo -e "{\n    acme_dns cloudflare ${token}\n}\n"
+            cat "$target_file"
+        } > "$tmp_file"
+    fi
+
+    if [ -s "$tmp_file" ]; then
+        mv -f "$tmp_file" "$target_file"
+        return 0
+    else
+        rm -f "$tmp_file"
+        return 1
+    fi
+}
+
+# 彻底移除 Caddyfile 全局配置块中的 Cloudflare DNS-01 指令 (自动修剪空全局块)
+remove_cf_dns_token() {
+    local target_file="$1"
+    local target_dir
+    target_dir=$(dirname "$target_file")
+    local tmp_file
+    tmp_file=$(mktemp "${target_dir}/.cad_tmp.XXXXXX" 2>/dev/null) || tmp_file="${target_file}.tmp.$$"
+
+    awk '
+    function count_char(str, ch,   c, i, L) {
+        c = 0; L = length(str)
+        for (i = 1; i <= L; i++) if (substr(str, i, 1) == ch) c++
+        return c
+    }
+    BEGIN { in_global = 0; depth = 0; g_lines_cnt = 0; g_other_cnt = 0 }
+    {
+        raw = $0
+        line = raw
+        sub(/^[ \t]+/, "", line)
+        if (depth == 0) {
+            if (line ~ /^\{/) {
+                in_global = 1
+                open_c = count_char(line, "{")
+                close_c = count_char(line, "}")
+                depth = open_c - close_c
+                g_lines[0] = raw
+                g_lines_cnt = 1
+                g_other_cnt = 0
+                if (line ~ /acme_dns[ \t]+cloudflare/) {
+                    # 忽略
+                } else if (line !~ /^\{[ \t]*$/) {
+                    g_other_cnt++
+                }
+                if (depth <= 0) {
+                    in_global = 0
+                }
+                next
+            }
+        } else if (in_global) {
+            open_c = count_char(line, "{")
+            close_c = count_char(line, "}")
+            depth += (open_c - close_c)
+            if (line ~ /^[ \t]*acme_dns[ \t]+cloudflare/) {
+                # 忽略此行
+            } else {
+                g_lines[g_lines_cnt++] = raw
+                if (depth > 0 && line !~ /^[ \t]*$/ && line !~ /^[ \t]*#/) {
+                    g_other_cnt++
+                }
+            }
+            if (depth <= 0) {
+                if (g_other_cnt > 0) {
+                    for (i = 0; i < g_lines_cnt; i++) {
+                        print g_lines[i]
+                    }
+                }
+                in_global = 0
+            }
+            next
+        }
+        print raw
+    }
+    ' "$target_file" > "$tmp_file"
+
+    if [ -f "$tmp_file" ]; then
+        mv -f "$tmp_file" "$target_file"
+        return 0
+    fi
+    return 1
+}
+
+# 安装 / 升级为包含 Cloudflare DNS-01 模块的增强版 Caddy
+install_caddy_cf() {
+    clear
+    echo -e "${BLUE}====================================================${PLAIN}"
+    echo -e "${GREEN}    安装 / 升级 Cloudflare 增强版 Caddy (集成 DNS-01)    ${PLAIN}"
+    echo -e "${BLUE}====================================================${PLAIN}"
+    echo -e "说明: 增强版包含官方 caddy-dns/cloudflare 插件，单静态二进制无常驻内存开销。"
+    echo -e "支持: 泛域名证书申请、无入站端口 (NAT小鸡) 签发、穿透 Cloudflare 小黄云。\n"
+
+    # 确保基础运行环境与 systemd 配置完备 (若全新机器未曾安装 Caddy)
+    if ! command -v caddy >/dev/null 2>&1 && [ ! -f /lib/systemd/system/caddy.service ] && [ ! -f /etc/systemd/system/caddy.service ]; then
+        echo -e "${BLUE}检测到系统未安装 Caddy 基础环境，正在配置系统依赖与 systemd 服务...${PLAIN}"
+        if [ -f /etc/debian_version ]; then
+            apt update >/dev/null 2>&1
+            apt install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg >/dev/null 2>&1
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes >/dev/null 2>&1 || true
+            chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null || true
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null 2>&1 || true
+            chmod o+r /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null || true
+            apt update >/dev/null 2>&1
+            apt install -y caddy >/dev/null 2>&1
+        elif [ -f /etc/redhat-release ]; then
+            if command -v dnf > /dev/null 2>&1; then
+                (dnf install -y 'dnf-command(copr)' curl || dnf install -y dnf-plugins-core curl) >/dev/null 2>&1
+                dnf copr enable -y @caddy/caddy >/dev/null 2>&1
+                dnf install -y caddy >/dev/null 2>&1
+            fi
+        fi
+    fi
+
+    local arch
+    arch=$(detect_caddy_arch)
+    echo -e "${BLUE}[1/4] 检测到系统架构: ${GREEN}${arch}${PLAIN}"
+
+    local download_url="https://caddyserver.com/api/download?os=linux&arch=${arch}&p=github.com%2Fcaddy-dns%2Fcloudflare"
+    local tmp_bin
+    tmp_bin=$(mktemp "/tmp/caddy_cf.XXXXXX" 2>/dev/null) || tmp_bin="/tmp/caddy_cf_$$"
+
+    echo -e "${BLUE}[2/4] 正在从 Caddy 官方构建 API 下载增强版程序...${PLAIN}"
+    echo -e "下载地址: ${download_url}"
+    if ! curl -fSL --retry 3 --connect-timeout 20 --max-time 180 "$download_url" -o "$tmp_bin"; then
+        echo -e "${RED}✗ 下载失败！请检查 VPS 对 caddyserver.com 的网络连接。${PLAIN}"
+        rm -f "$tmp_bin"
+        pause
+        return 1
+    fi
+
+    echo -e "${BLUE}[3/4] 验证程序完整性与插件模块...${PLAIN}"
+    chmod +x "$tmp_bin"
+    if ! "$tmp_bin" version >/dev/null 2>&1; then
+        echo -e "${RED}✗ 下载的文件不是有效的 Caddy 二进制程序！${PLAIN}"
+        rm -f "$tmp_bin"
+        pause
+        return 1
+    fi
+
+    if ! "$tmp_bin" list-modules 2>/dev/null | grep -q 'dns.providers.cloudflare'; then
+        echo -e "${RED}✗ 程序验证失败: 未检测到 dns.providers.cloudflare 模块！${PLAIN}"
+        rm -f "$tmp_bin"
+        pause
+        return 1
+    fi
+    echo -e "${GREEN}✓ 模块验证通过: dns.providers.cloudflare 已就绪！${PLAIN}"
+
+    echo -e "${BLUE}[4/4] 安装二进制文件并设置系统服务权限...${PLAIN}"
+    local target_bin
+    target_bin=$(command -v caddy 2>/dev/null || echo "/usr/bin/caddy")
+    [ -z "$target_bin" ] && target_bin="/usr/bin/caddy"
+
+    # 备份原有标准二进制
+    if [ -f "$target_bin" ] && [ ! -f "${target_bin}.standard_bak" ]; then
+        cp -f "$target_bin" "${target_bin}.standard_bak" 2>/dev/null || true
+    fi
+
+    # 原子替换以绕过运行中文件的 ETXTBSY 锁
+    mv -f "$tmp_bin" "$target_bin"
+    chmod 755 "$target_bin"
+    chown root:root "$target_bin" 2>/dev/null || true
+    setcap cap_net_bind_service=+ep "$target_bin" 2>/dev/null || true
+
+    # 若系统存在 apt-mark 则锁定版本，防止 apt upgrade 覆盖增强版
+    if command -v apt-mark >/dev/null 2>&1; then
+        apt-mark hold caddy >/dev/null 2>&1 || true
+        echo -e "${GREEN}✓ 已锁定 APT 软件源中的 caddy 软件包，防止系统常规更新覆盖增强版。${PLAIN}"
+    fi
+
+    init_env
+    ensure_caddyfile_perms "$CADDY_FILE"
+    systemctl enable caddy >/dev/null 2>&1 || true
+    systemctl restart caddy >/dev/null 2>&1 || true
+
+    local new_ver
+    new_ver=$("$target_bin" version 2>/dev/null | awk '{print $1}')
+    echo -e "\n${GREEN}✓ Cloudflare 增强版 Caddy 已成功安装并就绪！${PLAIN}"
+    echo -e "当前主程序版本: ${BOLD}${new_ver}${PLAIN} (含 dns.providers.cloudflare 插件)"
+    pause
+    return 0
+}
+
+# 恢复为系统官方标准版 Caddy (移除 DNS-01 插件)
+switch_caddy_standard() {
+    clear
+    echo -e "${BLUE}====================================================${PLAIN}"
+    echo -e "${GREEN}               恢复为官方标准版 Caddy                ${PLAIN}"
+    echo -e "${BLUE}====================================================${PLAIN}"
+    echo -e "${YELLOW}提示: 恢复为官方标准版将移除 Cloudflare DNS-01 插件。${PLAIN}"
+    read -p "确定要恢复为官方标准版吗? (y/n): " confirm_sw
+    if [[ "$confirm_sw" != "y" && "$confirm_sw" != "Y" ]]; then
+        return
+    fi
+
+    if has_cf_dns_token; then
+        echo -e "${YELLOW}检测到当前配置中包含 Cloudflare DNS-01 Token。${PLAIN}"
+        read -p "是否同时清理 Caddyfile 中的 acme_dns 规则? (y/n): " clean_token
+        if [[ "$clean_token" == "y" || "$clean_token" == "Y" ]]; then
+            remove_cf_dns_token "$CADDY_FILE"
+            ensure_caddyfile_perms "$CADDY_FILE"
+        fi
+    fi
+
+    local target_bin
+    target_bin=$(command -v caddy 2>/dev/null || echo "/usr/bin/caddy")
+    [ -z "$target_bin" ] && target_bin="/usr/bin/caddy"
+
+    if [ -f "${target_bin}.standard_bak" ]; then
+        echo -e "${BLUE}正在从本地标准版备份恢复...${PLAIN}"
+        cp -f "${target_bin}.standard_bak" "$target_bin"
+        chmod 755 "$target_bin"
+        chown root:root "$target_bin" 2>/dev/null || true
+        setcap cap_net_bind_service=+ep "$target_bin" 2>/dev/null || true
+    else
+        echo -e "${BLUE}正在重新安装系统标准版软件包...${PLAIN}"
+        if command -v apt-mark >/dev/null 2>&1; then
+            apt-mark unhold caddy >/dev/null 2>&1 || true
+            apt update >/dev/null 2>&1
+            apt install --reinstall -y caddy >/dev/null 2>&1
+        elif [ -f /etc/redhat-release ]; then
+            (dnf reinstall -y caddy 2>/dev/null || yum reinstall -y caddy 2>/dev/null)
+        else
+            local arch
+            arch=$(detect_caddy_arch)
+            curl -fSL "https://caddyserver.com/api/download?os=linux&arch=${arch}" -o "$target_bin" 2>/dev/null
+            chmod 755 "$target_bin"
+            setcap cap_net_bind_service=+ep "$target_bin" 2>/dev/null || true
+        fi
+    fi
+
+    if command -v apt-mark >/dev/null 2>&1; then
+        apt-mark unhold caddy >/dev/null 2>&1 || true
+    fi
+
+    ensure_caddyfile_perms "$CADDY_FILE"
+    systemctl restart caddy >/dev/null 2>&1 || true
+    echo -e "\n${GREEN}✓ 已恢复为官方标准版 Caddy！${PLAIN}"
+    pause
+}
+
+# 交互式配置 Cloudflare API Token
+configure_cf_dns_token() {
+    clear
+    echo -e "${BLUE}================================================================${PLAIN}"
+    echo -e "${GREEN}${BOLD}           配置 / 更新 Cloudflare DNS-01 API Token              ${PLAIN}"
+    echo -e "${BLUE}================================================================${PLAIN}"
+
+    if ! has_cf_dns_module; then
+        echo -e "${YELLOW}⚠️  检测到当前 Caddy 尚未集成 Cloudflare DNS 模块！${PLAIN}"
+        echo -e "启用 DNS-01 验证前，必须使用包含 dns.providers.cloudflare 的增强版程序。"
+        read -p "是否立即自动下载并升级为 Cloudflare 增强版 Caddy? (y/n): " do_install_cf
+        if [[ "$do_install_cf" == "y" || "$do_install_cf" == "Y" ]]; then
+            if ! install_caddy_cf; then
+                return 1
+            fi
+        else
+            echo -e "${YELLOW}已取消操作。未安装增强版前无法启用 DNS-01 规则。${PLAIN}"
+            pause
+            return 1
+        fi
+    fi
+
+    echo -e "\n${BLUE}【Cloudflare API Token 获取指引】${PLAIN}"
+    echo -e "  1. 登录 Cloudflare 控制台: https://dash.cloudflare.com/profile/api-tokens"
+    echo -e "  2. 点击「创建令牌」(Create Token) ➔ 选择「使用模板: 编辑区域 DNS」(Edit zone DNS)"
+    echo -e "  3. 权限要求: ${BOLD}区域 - DNS - 编辑${PLAIN} (Zone - DNS - Edit)"
+    echo -e "  4. 区域资源: ${BOLD}包括 - 所有区域${PLAIN} (All zones) 或 指定所需托管域名"
+    echo -e "  5. 创建完成后复制 Token (注意: 绝非 Global API Key，保障主账号安全)\n"
+
+    local old_token
+    old_token=$(get_cf_dns_token 2>/dev/null || true)
+    if [ -n "$old_token" ]; then
+        local mask_old="${old_token:0:4}****${old_token: -4}"
+        echo -e "当前已配置 Token: ${YELLOW}${mask_old}${PLAIN}"
+        read -p "请输入新的 Cloudflare API Token (回车保持原样): " input_token
+        input_token=$(echo "$input_token" | tr -d '[:space:]')
+        if [ -z "$input_token" ]; then
+            echo -e "${YELLOW}未做任何修改。${PLAIN}"
+            pause
+            return 0
+        fi
+    else
+        read -p "请输入 Cloudflare API Token: " input_token
+        input_token=$(echo "$input_token" | tr -d '[:space:]')
+        if [ -z "$input_token" ]; then
+            echo -e "${RED}[错误] Token 不能为空！${PLAIN}"
+            pause
+            return 1
+        fi
+    fi
+
+    create_backup "配置 Cloudflare DNS-01 Token 前备份"
+    if apply_cf_dns_token "$CADDY_FILE" "$input_token"; then
+        ensure_caddyfile_perms "$CADDY_FILE"
+        if safe_reload; then
+            echo -e "\n${GREEN}✓ Cloudflare DNS-01 验证引擎已成功激活并平滑生效！${PLAIN}"
+            echo -e "${BLUE}💡 所有通过 Caddy 管理的站点在申请/续期证书时，将全自动通过 Cloudflare DNS 验证。${PLAIN}"
+            echo -e "${BLUE}💡 无需开放 80/443 入站端口，彻底穿透 Cloudflare 小黄云代理与 NAT 限制！${PLAIN}"
+        else
+            echo -e "\n${RED}✗ 配置重载失败，已自动回滚。请检查 Token 是否有效或语法是否合规！${PLAIN}"
+        fi
+    else
+        echo -e "\n${RED}✗ 写入 Cloudflare 配置失败！${PLAIN}"
+    fi
+    pause
+}
+
+# 交互式移除 Cloudflare DNS-01 配置
+disable_cf_dns_token() {
+    clear
+    echo -e "${BLUE}================================================================${PLAIN}"
+    echo -e "${GREEN}${BOLD}           移除 Cloudflare DNS-01 验证配置                     ${PLAIN}"
+    echo -e "${BLUE}================================================================${PLAIN}"
+
+    if ! has_cf_dns_token; then
+        echo -e "${YELLOW}当前配置中未设置 Cloudflare DNS-01 Token，无需移除。${PLAIN}"
+        pause
+        return 0
+    fi
+
+    echo -e "${YELLOW}移除后，Caddy 将切回默认的 HTTP-01 验证模式 (需要直连 80/443 端口且不能被 CDN 拦截)。${PLAIN}"
+    read -p "确认移除 Cloudflare DNS-01 验证配置吗? (y/n): " confirm_del
+    if [[ "$confirm_del" != "y" && "$confirm_del" != "Y" ]]; then
+        return 0
+    fi
+
+    create_backup "移除 Cloudflare DNS-01 配置前备份"
+    if remove_cf_dns_token "$CADDY_FILE"; then
+        ensure_caddyfile_perms "$CADDY_FILE"
+        if safe_reload; then
+            echo -e "\n${GREEN}✓ 已成功移除 Cloudflare DNS-01 配置，恢复为默认 HTTP-01 验证模式。${PLAIN}"
+        else
+            echo -e "\n${RED}✗ 配置重载失败，已自动回滚。${PLAIN}"
+        fi
+    else
+        echo -e "\n${RED}✗ 移除配置失败！${PLAIN}"
+    fi
+    pause
+}
+
+# 菜单 6: SSL 证书中心 & DNS-01 自动化管理
+ssl_center_menu() {
+    while true; do
+        clear
+        echo -e "${BLUE}================================================================${PLAIN}"
+        echo -e "${GREEN}${BOLD}             SSL 证书中心 & ACME DNS-01 自动化管理              ${PLAIN}"
+        echo -e "${BLUE}================================================================${PLAIN}"
+
+        local ed_str="${YELLOW}官方标准版 (未集成 DNS-01 插件)${PLAIN}"
+        if has_cf_dns_module; then
+            ed_str="${GREEN}Cloudflare 增强版 (已集成 DNS-01 插件)${PLAIN}"
+        fi
+        echo -e "当前 Caddy 版本 : ${ed_str}"
+
+        local tok_str="${YELLOW}未配置 (默认 HTTP-01 验证)${PLAIN}"
+        if is_cf_dns_active; then
+            local t
+            t=$(get_cf_dns_token)
+            local mask_t="${t:0:4}****${t: -4}"
+            tok_str="${GREEN}已激活 (Cloudflare DNS-01, Token: ${mask_t})${PLAIN}"
+        elif has_cf_dns_token; then
+            tok_str="${RED}Token 已配置但缺失 Cloudflare 插件${PLAIN}"
+        elif has_cf_dns_module; then
+            tok_str="${YELLOW}插件已就绪, 待配置 Token${PLAIN}"
+        fi
+        echo -e "DNS-01 引擎状态 : ${tok_str}"
+        echo -e "${BLUE}----------------------------------------------------------------${PLAIN}"
+        echo -e "  ${GREEN}1.${PLAIN} SSL Doctor 证书体检与网络综合诊断 (全链路排错)"
+        echo -e "  ${GREEN}2.${PLAIN} 安装 / 升级 Cloudflare 增强版 Caddy (集成 DNS-01 模块)"
+        echo -e "  ${GREEN}3.${PLAIN} 配置 / 更新 Cloudflare API Token (开启全自动 DNS-01)"
+        echo -e "  ${GREEN}4.${PLAIN} 移除 Cloudflare DNS-01 配置 (切回默认 HTTP-01 验证)"
+        echo -e "  ${GREEN}5.${PLAIN} 恢复为官方标准版 Caddy (移除 DNS-01 插件)"
+        echo -e "  ${GREEN}0.${PLAIN} 返回主菜单"
+        echo -e "${BLUE}================================================================${PLAIN}"
+
+        read -p "请输入功能编号 [0-5]: " sc_num
+        case "$sc_num" in
+            1)
+                ssl_doctor
+                ;;
+            2)
+                install_caddy_cf
+                ;;
+            3)
+                configure_cf_dns_token
+                ;;
+            4)
+                disable_cf_dns_token
+                ;;
+            5)
+                switch_caddy_standard
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                echo -e "${RED}输入无效，请重新选择！${PLAIN}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# CLI 模式: Cloudflare 状态展示
+cli_cf_status() {
+    echo -e "${BLUE}================== Cloudflare DNS-01 引擎状态 ==================${PLAIN}"
+    if has_cf_dns_module; then
+        echo -e "Caddy 插件模块: ${GREEN}已安装 (dns.providers.cloudflare)${PLAIN}"
+    else
+        echo -e "Caddy 插件模块: ${RED}未安装 (当前为官方标准版)${PLAIN}"
+    fi
+
+    if has_cf_dns_token; then
+        local t
+        t=$(get_cf_dns_token)
+        local mask_t="${t:0:4}****${t: -4}"
+        echo -e "API Token 配置: ${GREEN}已配置${PLAIN} (${mask_t})"
+    else
+        echo -e "API Token 配置: ${YELLOW}未配置${PLAIN}"
+    fi
+
+    if is_cf_dns_active; then
+        echo -e "综合运行状态  : ${GREEN}● DNS-01 引擎已就绪并生效${PLAIN}"
+        echo -e "特性说明      : 支持泛域名申请、无视入站端口受限、无视 Cloudflare 小黄云拦截"
+    else
+        echo -e "综合运行状态  : ${YELLOW}○ 未生效 (使用默认 HTTP-01 / TLS-ALPN-01 模式)${PLAIN}"
+    fi
+    echo -e "${BLUE}================================================================${PLAIN}"
+}
+
+# CLI 模式: 快捷设置 Token
+cli_cf_set() {
+    local token="$1"
+    token=$(echo "$token" | tr -d '[:space:]')
+    if [ -z "$token" ]; then
+        echo -e "${RED}[错误] 请提供有效的 Cloudflare API Token！用法: cad cf set <TOKEN>${PLAIN}"
+        exit 1
+    fi
+    if ! has_cf_dns_module; then
+        echo -e "${RED}[错误] 当前 Caddy 尚未集成 Cloudflare DNS 模块！${PLAIN}"
+        echo -e "${YELLOW}请先运行 'cad' 进入菜单 6 安装 Cloudflare 增强版 Caddy。${PLAIN}"
+        exit 1
+    fi
+    create_backup "CLI 设置 Cloudflare Token"
+    if apply_cf_dns_token "$CADDY_FILE" "$token"; then
+        ensure_caddyfile_perms "$CADDY_FILE"
+        if safe_reload; then
+            echo -e "${GREEN}✓ Cloudflare API Token 已成功配置，DNS-01 引擎已就绪！${PLAIN}"
+            exit 0
+        else
+            echo -e "${RED}✗ 配置更新后重载失败，已自动回滚。${PLAIN}"
+            exit 1
+        fi
+    else
+        echo -e "${RED}✗ 写入配置失败！${PLAIN}"
+        exit 1
+    fi
+}
+
+# CLI 模式: 快捷移除 Token
+cli_cf_remove() {
+    if ! has_cf_dns_token; then
+        echo -e "${YELLOW}当前配置中未发现 Cloudflare DNS-01 Token。${PLAIN}"
+        exit 0
+    fi
+    create_backup "CLI 移除 Cloudflare Token"
+    if remove_cf_dns_token "$CADDY_FILE"; then
+        ensure_caddyfile_perms "$CADDY_FILE"
+        if safe_reload; then
+            echo -e "${GREEN}✓ 已移除 Cloudflare DNS-01 配置，切回默认 HTTP-01 验证模式。${PLAIN}"
+            exit 0
+        else
+            echo -e "${RED}✗ 移除后重载失败，已自动回滚。${PLAIN}"
+            exit 1
+        fi
+    else
+        echo -e "${RED}✗ 移除配置失败！${PLAIN}"
+        exit 1
+    fi
 }
 
 # 菜单 7: 快照时光机与安全回滚 (Snapshot Time-Machine)
@@ -1772,10 +2435,11 @@ service_control() {
 }
 
 # 菜单 12: Caddy 一键安装模块
-install_caddy() {
+# 一键安装 / 更新官方标准版 Caddy
+install_caddy_standard() {
     clear
     echo -e "${BLUE}====================================================${PLAIN}"
-    echo -e "${GREEN}             一键安装 / 升级 Caddy 环境              ${PLAIN}"
+    echo -e "${GREEN}          一键安装 / 升级官方标准版 Caddy            ${PLAIN}"
     echo -e "${BLUE}====================================================${PLAIN}"
 
     if command -v caddy > /dev/null 2>&1; then
@@ -1828,13 +2492,46 @@ install_caddy() {
     pause
 }
 
+# 菜单 12: 一键安装 / 更新 Caddy 环境 (支持标准版与 Cloudflare 增强版)
+install_caddy() {
+    clear
+    echo -e "${BLUE}====================================================${PLAIN}"
+    echo -e "${GREEN}             一键安装 / 升级 Caddy 环境              ${PLAIN}"
+    echo -e "${BLUE}====================================================${PLAIN}"
+    echo -e "请选择要安装或更新的 Caddy 版本："
+    echo -e "  1. 官方标准版 Caddy (基于系统软件包管理器，纯净稳定)"
+    echo -e "  2. Cloudflare 增强版 Caddy (集成 DNS-01 模块，支持泛域名/小黄云穿透)"
+    echo -e "  0. 返回主菜单"
+    read -p "请输入选项 [0-2] (回车默认 2): " inst_opt
+    inst_opt="${inst_opt:-2}"
+    case "$inst_opt" in
+        1)
+            install_caddy_standard
+            ;;
+        2)
+            install_caddy_cf
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选项！${PLAIN}"
+            pause
+            ;;
+    esac
+}
+
 # CLI 模式: 状态输出
 cli_status() {
     echo -e "${BLUE}======================== Caddy 运行状态报告 ========================${PLAIN}"
     if command -v caddy > /dev/null 2>&1; then
         local caddy_ver
         caddy_ver=$(caddy version 2>/dev/null | awk '{print $1}')
-        echo -e "Caddy 主程序  : ${GREEN}已安装${PLAIN} (版本: ${caddy_ver})"
+        local caddy_edition="官方标准版"
+        if has_cf_dns_module; then
+            caddy_edition="Cloudflare 增强版"
+        fi
+        echo -e "Caddy 主程序  : ${GREEN}已安装${PLAIN} (版本: ${caddy_ver}, 发行: ${GREEN}${caddy_edition}${PLAIN})"
     else
         echo -e "Caddy 主程序  : ${RED}未安装${PLAIN}"
     fi
@@ -1844,6 +2541,19 @@ cli_status() {
     else
         echo -e "Systemd 服务  : ${RED}● 已停止 (Inactive)${PLAIN}"
     fi
+
+    local acme_status="${YELLOW}默认 HTTP-01 / TLS-ALPN-01 模式${PLAIN}"
+    if is_cf_dns_active; then
+        local t
+        t=$(get_cf_dns_token)
+        local mask_t="${t:0:4}****${t: -4}"
+        acme_status="${GREEN}● Cloudflare DNS-01 自动化引擎 (Token: ${mask_t})${PLAIN}"
+    elif has_cf_dns_token; then
+        acme_status="${RED}Token 已配置但缺失 Cloudflare 插件模块${PLAIN}"
+    elif has_cf_dns_module; then
+        acme_status="${YELLOW}Cloudflare 插件已安装 (待配置 Token)${PLAIN}"
+    fi
+    echo -e "ACME 证书引擎 : ${acme_status}"
 
     load_rules
     local act_cnt=0
@@ -1882,6 +2592,9 @@ show_help() {
     echo -e "  cad reload           预检并平滑重载 Caddyfile 配置"
     echo -e "  cad doctor [domain]  执行 SSL 证书与网络诊断 (双栈/DNS/CF/端口冲突)"
     echo -e "  cad backup [note]    创建当前配置的时间戳快照备份"
+    echo -e "  cad cf status        查看 Cloudflare DNS-01 模块与 Token 状态"
+    echo -e "  cad cf set <token>   配置 Cloudflare API Token 并开启 DNS-01"
+    echo -e "  cad cf remove        移除 Cloudflare DNS-01 配置 (切回 HTTP-01)"
     echo -e "  cad -v, --version    查看版本信息"
     echo -e "  cad -h, --help       查看帮助信息"
 }
@@ -1904,7 +2617,7 @@ main_menu() {
         echo -e "  ${GREEN}3.${PLAIN} 交互式修改反代规则 (免开Nano/原位修改)"
         echo -e "  ${GREEN}4.${PLAIN} 启用 / 停用反代规则 (无损状态切换)"
         echo -e "  ${GREEN}5.${PLAIN} 删除已有反代规则"
-        echo -e "  ${GREEN}6.${PLAIN} SSL 证书体检与网络诊断 (双栈/DNS/CF/端口冲突)"
+        echo -e "  ${GREEN}6.${PLAIN} SSL 证书中心 & DNS-01 自动化 (SSL Doctor/Cloudflare)"
         echo -e "  ${GREEN}7.${PLAIN} 快照时光机与安全回滚 (保留15个版本/Diff对比)"
         echo -e "  ${GREEN}8.${PLAIN} 检查配置并平滑重载 Caddy (免重启生效)"
         echo -e "  ${GREEN}9.${PLAIN} 手动编辑 Caddyfile 配置文件 (安全预检+草稿保护)"
@@ -1929,7 +2642,15 @@ main_menu() {
         if systemctl is-active --quiet caddy 2>/dev/null; then
             svc_status="${GREEN}● 正在运行 (Active)${PLAIN}"
         fi
-        echo -e "服务状态: ${svc_status} | 规则统计: ${GREEN}${active_rules} 启用${PLAIN}, ${YELLOW}${disabled_rules} 停用${PLAIN}"
+        local acme_summary="${YELLOW}HTTP-01 (默认)${PLAIN}"
+        if is_cf_dns_active; then
+            acme_summary="${GREEN}Cloudflare DNS-01 (已启用)${PLAIN}"
+        elif has_cf_dns_token; then
+            acme_summary="${RED}Token已配置缺插件${PLAIN}"
+        elif has_cf_dns_module; then
+            acme_summary="${YELLOW}插件就绪待配Token${PLAIN}"
+        fi
+        echo -e "服务状态: ${svc_status} | 规则统计: ${GREEN}${active_rules} 启用${PLAIN}, ${YELLOW}${disabled_rules} 停用${PLAIN} | ACME: ${acme_summary}"
         echo -e "${BLUE}----------------------------------------------------------------${PLAIN}"
 
         read -p "请输入功能编号 [0-12]: " num
@@ -1951,7 +2672,7 @@ main_menu() {
                 del_rule
                 ;;
             6)
-                ssl_doctor
+                ssl_center_menu
                 ;;
             7)
                 snapshot_time_machine
@@ -2017,6 +2738,27 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             init_env
             create_backup "${2:-CLI手动创建快照}"
             echo -e "${GREEN}✓ 配置快照已成功创建并保存至: ${BACKUP_DIR}${PLAIN}"
+            exit 0
+            ;;
+        cf)
+            check_root
+            init_env
+            case "$2" in
+                set)
+                    cli_cf_set "$3"
+                    ;;
+                remove|rm|del)
+                    cli_cf_remove
+                    ;;
+                status|"")
+                    cli_cf_status
+                    ;;
+                *)
+                    echo -e "${RED}[错误] 未知的 cf 子命令: $2${PLAIN}"
+                    echo -e "用法: cad cf [status | set <token> | remove]"
+                    exit 1
+                    ;;
+            esac
             exit 0
             ;;
         help|--help|-h)
