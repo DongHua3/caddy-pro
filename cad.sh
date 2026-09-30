@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  项目名称: caddy-pro (快捷指令: cad)
-#  版本编号: v3.1.1
+#  版本编号: v3.2.0
 #  版权所有: (c) 2026 DongHua3
 #  开源协议: MIT (SPDX-License-Identifier: MIT)
 #  项目定位: 极简、轻量、高可靠的 Caddy 反向代理交互式管理系统
 #  核心特性: AST深度解析、免Nano原位修改、智能HTTPS上游探测、无损启停、
-#            Cloudflare DNS-01自动化、单实例排他锁、复合路由共存保护、
-#            SSL Doctor网络体检、时光机快照回滚、双模CLI
+#            Cloudflare DNS-01自动化、AI大模型流式网关、受控HTTP/3智能探针、
+#            单实例排他锁、复合路由共存保护、SSL Doctor网络体检、时光机快照回滚、双模CLI
 # ==============================================================================
 
 # 全局文件权限掩码声明 (确保默认生成文件为 0644，目录为 0755)
@@ -18,7 +18,7 @@ CADDY_BAK="${CADDY_BAK:-/etc/caddy/Caddyfile.bak}"
 BACKUP_DIR="${BACKUP_DIR:-/etc/caddy/backups}"
 MAX_BACKUPS="${MAX_BACKUPS:-15}"
 INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/cad}"
-VERSION="3.1.1"
+VERSION="3.2.0"
 
 # 终端色彩定义
 RED='\033[0;31m'
@@ -38,6 +38,8 @@ declare -a RULE_TARGET=()
 declare -a RULE_PROTO=()
 declare -a RULE_PATH=()
 declare -a RULE_TLS_SKIP=()
+declare -a RULE_AI_OPT=()
+declare -a RULE_H3=()
 declare -i RULE_TOTAL=0
 
 CAD_LOCK_FILE="${CAD_LOCK_FILE:-/run/lock/caddy_pro.lock}"
@@ -529,6 +531,8 @@ parse_caddyfile() {
                     rule_proto = "http"
                     rule_path = ""
                     rule_tls_skip = 0
+                    rule_ai_opt = 0
+                    rule_h3 = 0
 
                     open_c = count_char(eff_line, "{")
                     close_c = count_char(eff_line, "}")
@@ -573,6 +577,12 @@ parse_caddyfile() {
                 if (eff_line ~ /tls_insecure_skip_verify/) {
                     rule_tls_skip = 1
                 }
+                if (eff_line ~ /flush_interval[ \t]+-1/) {
+                    rule_ai_opt = 1
+                }
+                if (eff_line ~ /header[ \t]+Alt-Svc.*h3/) {
+                    rule_h3 = 1
+                }
             }
 
             depth += (open_c - close_c)
@@ -580,7 +590,7 @@ parse_caddyfile() {
                 if (in_site) {
                     rule_end = NR
                     rule_count++
-                    printf("%d|%s|%d|%d|%s|%s|%s|%s|%d\n", rule_count, rule_status, rule_start, rule_end, rule_domain, rule_target, rule_proto, rule_path, rule_tls_skip)
+                    printf("%d|%s|%d|%d|%s|%s|%s|%s|%d|%d|%d\n", rule_count, rule_status, rule_start, rule_end, rule_domain, rule_target, rule_proto, rule_path, rule_tls_skip, rule_ai_opt, rule_h3)
                 }
                 in_site = 0
                 depth = 0
@@ -600,12 +610,14 @@ load_rules() {
     RULE_PROTO=()
     RULE_PATH=()
     RULE_TLS_SKIP=()
+    RULE_AI_OPT=()
+    RULE_H3=()
     RULE_TOTAL=0
 
     [ -s "$CADDY_FILE" ] || return 0
 
-    local idx status s_line e_line domain target proto path tls_skip
-    while IFS='|' read -r idx status s_line e_line domain target proto path tls_skip; do
+    local idx status s_line e_line domain target proto path tls_skip ai_opt h3
+    while IFS='|' read -r idx status s_line e_line domain target proto path tls_skip ai_opt h3; do
         [ -z "$idx" ] && continue
         RULE_STATUS[idx]="$status"
         RULE_START[idx]="$s_line"
@@ -615,6 +627,8 @@ load_rules() {
         RULE_PROTO[idx]="$proto"
         RULE_PATH[idx]="$path"
         RULE_TLS_SKIP[idx]="$tls_skip"
+        RULE_AI_OPT[idx]="${ai_opt:-0}"
+        RULE_H3[idx]="${h3:-0}"
         RULE_TOTAL=$idx
     done < <(parse_caddyfile "$CADDY_FILE")
 }
@@ -642,6 +656,12 @@ list_rules() {
         local p_info="${RULE_PROTO[i]^^}"
         if [ "${RULE_PROTO[i]}" == "https" ] && [ "${RULE_TLS_SKIP[i]}" -eq 1 ]; then
             p_info="HTTPS (TLS Skip)"
+        fi
+        if [ "${RULE_AI_OPT[i]}" -eq 1 ]; then
+            p_info="${p_info}+⚡AI流式"
+        fi
+        if [ "${RULE_H3[i]}" -eq 1 ]; then
+            p_info="${p_info}+🚀H3"
         fi
 
         local tgt_display="${RULE_TARGET[i]:-(自定义/无代理)}"
@@ -776,6 +796,29 @@ add_rule() {
         new_path="/$new_path"
     fi
 
+    echo -e "\n${BLUE}--- 场景加速与增强预设 (正交可选) ---${PLAIN}"
+    read -p "是否开启 ⚡ AI 大模型流式优化 (防打字机卡顿 + 300s/600s长保活)? (y/n, 默认 n): " do_ai
+    local final_ai_opt=0
+    if [[ "$do_ai" == "y" || "$do_ai" == "Y" ]]; then
+        final_ai_opt=1
+        echo -e "${GREEN}✓ 已选择开启 AI 流式优化模式！${PLAIN}"
+    fi
+
+    read -p "是否开启 🚀 HTTP/3 (QUIC / UDP 443) 极速通道? (y/n, 默认 n): " do_h3
+    local final_h3=0
+    if [[ "$do_h3" == "y" || "$do_h3" == "Y" ]]; then
+        echo -e "${BLUE}正在检测宿主机 UDP 443 端口状态...${PLAIN}"
+        if check_udp_443_conflict; then
+            final_h3=1
+            echo -e "${GREEN}✓ [安全检测通过] UDP 443 端口无冲突，已开启 HTTP/3！${PLAIN}"
+            echo -e "${BLUE}💡 提示: 请确保云服务商安全组及本机防火墙已放行 UDP 443 端口。${PLAIN}"
+        else
+            final_h3=0
+            echo -e "${YELLOW}提示: 为保障现有服务安全，已自动放弃开启 HTTP/3。${PLAIN}"
+        fi
+        sleep 1
+    fi
+
     create_backup "添加规则前备份: ${new_domain}"
 
     local p_arg=""
@@ -784,24 +827,30 @@ add_rule() {
     local tgt_url="$probe_raw"
     [ "$final_proto" == "https" ] && tgt_url="https://${probe_raw}"
 
-    if [ "$final_proto" == "https" ] && [ "$final_tls_skip" -eq 1 ]; then
-        cat << RULE >> "$CADDY_FILE"
+    local h3_header=""
+    [ "$final_h3" -eq 1 ] && h3_header="    header Alt-Svc \"h3=\\\":443\\\"; ma=2592000\"\n"
 
-$new_domain {
-    reverse_proxy ${p_arg}${tgt_url} {
-        transport http {
-            tls_insecure_skip_verify
-        }
-    }
-}
-RULE
+    if [ "$final_ai_opt" -eq 1 ]; then
+        if [ "$final_proto" == "https" ]; then
+            local skip_line=""
+            [ "$final_tls_skip" -eq 1 ] && skip_line="            tls_insecure_skip_verify\n"
+            printf "\n%s {\n%b    reverse_proxy %s%s {\n        flush_interval -1\n        transport http {\n%b            response_header_timeout 300s\n            read_timeout 600s\n        }\n    }\n}\n" "$new_domain" "$h3_header" "$p_arg" "$tgt_url" "$skip_line" >> "$CADDY_FILE"
+        else
+            printf "\n%s {\n%b    reverse_proxy %s%s {\n        flush_interval -1\n        transport http {\n            response_header_timeout 300s\n            read_timeout 600s\n        }\n    }\n}\n" "$new_domain" "$h3_header" "$p_arg" "$tgt_url" >> "$CADDY_FILE"
+        fi
+    elif [ "$final_proto" == "https" ] && [ "$final_tls_skip" -eq 1 ]; then
+        printf "\n%s {\n%b    reverse_proxy %s%s {\n        transport http {\n            tls_insecure_skip_verify\n        }\n    }\n}\n" "$new_domain" "$h3_header" "$p_arg" "$tgt_url" >> "$CADDY_FILE"
     else
-        cat << RULE >> "$CADDY_FILE"
+        if [ "$final_h3" -eq 1 ]; then
+            printf "\n%s {\n%b    reverse_proxy %s%s\n}\n" "$new_domain" "$h3_header" "$p_arg" "$tgt_url" >> "$CADDY_FILE"
+        else
+            cat << RULE >> "$CADDY_FILE"
 
 $new_domain {
     reverse_proxy ${p_arg}${tgt_url}
 }
 RULE
+        fi
     fi
 
     ensure_caddyfile_perms "$CADDY_FILE"
@@ -824,6 +873,8 @@ update_rule_block() {
     local new_path="$7"
     local new_tls_skip="$8"
     local new_status="$9"
+    local new_ai_opt="${10:-0}"
+    local new_h3="${11:-0}"
 
     local p_arg=""
     [ -n "$new_path" ] && p_arg="${new_path} "
@@ -832,7 +883,15 @@ update_rule_block() {
 
     local rp_content=""
     if [ -n "$new_target" ]; then
-        if [ "$new_proto" == "https" ] && [ "$new_tls_skip" -eq 1 ]; then
+        if [ "$new_ai_opt" -eq 1 ]; then
+            if [ "$new_proto" == "https" ]; then
+                local skip_line=""
+                [ "$new_tls_skip" -eq 1 ] && skip_line="            tls_insecure_skip_verify\n"
+                rp_content=$(printf "    reverse_proxy %s%s {\n        flush_interval -1\n        transport http {\n%b            response_header_timeout 300s\n            read_timeout 600s\n        }\n    }" "$p_arg" "$tgt_url" "$skip_line")
+            else
+                rp_content=$(printf "    reverse_proxy %s%s {\n        flush_interval -1\n        transport http {\n            response_header_timeout 300s\n            read_timeout 600s\n        }\n    }" "$p_arg" "$tgt_url")
+            fi
+        elif [ "$new_proto" == "https" ] && [ "$new_tls_skip" -eq 1 ]; then
             rp_content=$(printf "    reverse_proxy %s%s {\n        transport http {\n            tls_insecure_skip_verify\n        }\n    }" "$p_arg" "$tgt_url")
         else
             rp_content=$(printf "    reverse_proxy %s%s" "$p_arg" "$tgt_url")
@@ -853,6 +912,7 @@ update_rule_block() {
     awk -v s="$s_line" -v e="$e_line" \
         -v nd="$new_domain" \
         -v nstatus="$new_status" \
+        -v nh3="$new_h3" \
         -v rfile="$rp_file" '
     function print_line(txt) {
         if (nstatus == "disabled") {
@@ -880,6 +940,14 @@ update_rule_block() {
 
         if (NR == s) {
             print_line(nd " {")
+            if (nh3 == 1) {
+                print_line("    header Alt-Svc \"h3=\\\":443\\\"; ma=2592000\"")
+            }
+            next
+        }
+
+        # 幂等性：清除原站点块内可能存在的旧 header Alt-Svc，防止重复堆叠
+        if (line ~ /^[ \t]*header[ \t]+Alt-Svc/) {
             next
         }
 
@@ -987,6 +1055,8 @@ edit_rule_inplace() {
     local cur_proto="${RULE_PROTO[sel_idx]}"
     local cur_path="${RULE_PATH[sel_idx]}"
     local cur_tls_skip="${RULE_TLS_SKIP[sel_idx]}"
+    local cur_ai_opt="${RULE_AI_OPT[sel_idx]:-0}"
+    local cur_h3="${RULE_H3[sel_idx]:-0}"
     local cur_status="${RULE_STATUS[sel_idx]}"
     local start_line="${RULE_START[sel_idx]}"
     local end_line="${RULE_END[sel_idx]}"
@@ -1031,17 +1101,25 @@ edit_rule_inplace() {
             fi
         fi
 
+        local ai_display="${YELLOW}○ 未开启 (默认缓冲)${PLAIN}"
+        [ "$cur_ai_opt" -eq 1 ] && ai_display="${GREEN}● 已开启 (打字机零缓冲 + 300s/600s超时)${PLAIN}"
+
+        local h3_display="${YELLOW}○ 未开启 (按 6 手动开启)${PLAIN}"
+        [ "$cur_h3" -eq 1 ] && h3_display="${GREEN}● 已开启 (Alt-Svc 极速通道)${PLAIN}"
+
         echo -e "  [1] 外部域名 (Domain)        : ${BOLD}${cur_domain}${PLAIN}"
         echo -e "  [2] 代理目标 (Target)        : ${BOLD}${cur_target}${PLAIN}"
         echo -e "  [3] 协议与TLS (Protocol/TLS) : ${proto_display}"
         echo -e "  [4] 路径路由 (Path Matcher)  : ${BOLD}${cur_path:-(全部流量)}${PLAIN}"
-        echo -e "  [5] 规则状态 (Status)        : ${st_display}"
-        echo -e "  [6] 保存修改并应用生效"
+        echo -e "  [5] ⚡ AI 流式优化 (SSE/超时) : ${ai_display}"
+        echo -e "  [6] 🚀 HTTP/3 (QUIC / UDP)  : ${h3_display}"
+        echo -e "  [7] 规则状态 (Status)        : ${st_display}"
+        echo -e "  [8] 保存修改并应用生效"
         echo -e "  [0] 放弃修改并返回"
         echo -e "${BLUE}================================================================${PLAIN}"
-        [ "$modified" -eq 1 ] && echo -e "${YELLOW}提示: 配置已产生变动，请选择 [6] 保存以生效。${PLAIN}"
+        [ "$modified" -eq 1 ] && echo -e "${YELLOW}提示: 配置已产生变动，请选择 [8] 保存以生效。${PLAIN}"
 
-        read -p "请输入修改项编号 [0-6]: " opt
+        read -p "请输入修改项编号 [0-8]: " opt
         case "$opt" in
             1)
                 echo -e "\n当前域名: ${GREEN}${cur_domain}${PLAIN}"
@@ -1128,6 +1206,36 @@ edit_rule_inplace() {
                 modified=1
                 ;;
             5)
+                if [ "$cur_ai_opt" -eq 1 ]; then
+                    cur_ai_opt=0
+                    echo -e "\n${YELLOW}已关闭 AI 流式优化模式。${PLAIN}"
+                else
+                    cur_ai_opt=1
+                    echo -e "\n${GREEN}已开启 AI 流式优化模式 (打字机零缓冲 + 300s/600s长超时保活)！${PLAIN}"
+                fi
+                modified=1
+                sleep 0.8
+                ;;
+            6)
+                if [ "$cur_h3" -eq 1 ]; then
+                    cur_h3=0
+                    echo -e "\n${YELLOW}已关闭 HTTP/3 (QUIC) 极速通道。${PLAIN}"
+                    modified=1
+                    sleep 0.8
+                else
+                    echo -e "\n${BLUE}正在对宿主机 UDP 443 端口进行物理占用强探针检测...${PLAIN}"
+                    if check_udp_443_conflict; then
+                        cur_h3=1
+                        echo -e "\n${GREEN}✓ [安全检测通过] UDP 443 端口无冲突，已开启 HTTP/3 (QUIC)！${PLAIN}"
+                        echo -e "${BLUE}💡 提示: 请确保云服务商安全组与本地防火墙 (ufw/firewalld) 已放行 443/UDP 端口。${PLAIN}"
+                        modified=1
+                    else
+                        echo -e "${YELLOW}提示: 为保障现有服务安全，已取消开启 HTTP/3。${PLAIN}"
+                    fi
+                    pause
+                fi
+                ;;
+            7)
                 if [ "$cur_status" == "active" ]; then
                     cur_status="disabled"
                 else
@@ -1135,10 +1243,10 @@ edit_rule_inplace() {
                 fi
                 modified=1
                 ;;
-            6)
+            8)
                 create_backup "修改规则前备份: ${cur_domain}"
                 update_rule_block "$CADDY_FILE" "$start_line" "$end_line" \
-                    "$cur_domain" "$cur_target" "$cur_proto" "$cur_path" "$cur_tls_skip" "$cur_status"
+                    "$cur_domain" "$cur_target" "$cur_proto" "$cur_path" "$cur_tls_skip" "$cur_status" "$cur_ai_opt" "$cur_h3"
 
                 if safe_reload; then
                     echo -e "\n${GREEN}✓ 规则 [${cur_domain}] 已成功就地修改并生效！${PLAIN}"
@@ -1503,6 +1611,87 @@ check_port_conflicts() {
     fi
 }
 
+# 辅助: 检测 UDP 443 端口是否被第三方进程占用 (支持排除 Caddy 自身)
+# 返回值: 0 表示空闲/Caddy复用(无冲突); 1 表示被第三方服务占用(有冲突)
+check_udp_443_conflict() {
+    local raw=""
+    local conflicts=()
+    local pids=()
+
+    # 1. 优先使用 ss 检测 UDP 443 (Linux UDP 状态通常为 UNCONN，严禁匹配 LISTEN)
+    if command -v ss > /dev/null 2>&1; then
+        raw=$(ss -ulpn '( sport = :443 )' 2>/dev/null | grep -v "caddy")
+        if [ -n "$raw" ]; then
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                [[ "$line" =~ :443[[:space:]] ]] || continue
+                local proc_info="未知进程"
+                local ppid=""
+                if [[ "$line" =~ users:\(\(\"?([^,\"]+)\"?,pid=([0-9]+) ]]; then
+                    local pname="${BASH_REMATCH[1]}"
+                    ppid="${BASH_REMATCH[2]}"
+                    proc_info="${pname} (PID: ${ppid})"
+                    pids+=("$ppid")
+                fi
+                if [ -n "$ppid" ]; then
+                    local cmd_args
+                    cmd_args=$(ps -p "$ppid" -o args= 2>/dev/null | tr -s ' ' | cut -c 1-55)
+                    [ -n "$cmd_args" ] && proc_info="${proc_info} [${cmd_args}]"
+                fi
+                conflicts+=("${proc_info}")
+            done <<< "$raw"
+        fi
+    elif command -v netstat > /dev/null 2>&1; then
+        raw=$(netstat -ulpn 2>/dev/null | grep -E ':443[[:space:]]' | grep -v "caddy")
+        if [ -n "$raw" ]; then
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                local pinfo
+                pinfo=$(echo "$line" | awk '{print $7}')
+                local ppid="${pinfo%/*}"
+                [ -n "$ppid" ] && pids+=("$ppid")
+                local cmd_args=""
+                [ -n "$ppid" ] && cmd_args=$(ps -p "$ppid" -o args= 2>/dev/null | tr -s ' ' | cut -c 1-55)
+                [ -n "$cmd_args" ] && pinfo="${pinfo} [${cmd_args}]"
+                conflicts+=("${pinfo}")
+            done <<< "$raw"
+        fi
+    elif command -v lsof > /dev/null 2>&1; then
+        raw=$(lsof -i UDP:443 -P -n 2>/dev/null | grep -v "caddy" | sed 1d)
+        if [ -n "$raw" ]; then
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                local pname ppid
+                pname=$(echo "$line" | awk '{print $1}')
+                ppid=$(echo "$line" | awk '{print $2}')
+                local cmd_args=""
+                [ -n "$ppid" ] && cmd_args=$(ps -p "$ppid" -o args= 2>/dev/null | tr -s ' ' | cut -c 1-55)
+                local desc="${pname} (PID: ${ppid})"
+                [ -n "$cmd_args" ] && desc="${desc} [${cmd_args}]"
+                conflicts+=("${desc}")
+            done <<< "$raw"
+        fi
+    elif [ -f /proc/net/udp ]; then
+        if grep -q -i ':01BB ' /proc/net/udp 2>/dev/null || ( [ -f /proc/net/udp6 ] && grep -q -i ':01BB ' /proc/net/udp6 2>/dev/null ); then
+            if ! pgrep -x caddy >/dev/null 2>&1; then
+                conflicts+=("系统级 UDP 443 活跃占用 (来源: /proc/net/udp)")
+            fi
+        fi
+    fi
+
+    if [ ${#conflicts[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}⚠️  [端口冲突拦截] 检测到 UDP 443 端口已被第三方进程独占：${PLAIN}"
+        for c in "${conflicts[@]}"; do
+            echo -e "  - ${RED}${c}${PLAIN}"
+        done
+        echo -e "${YELLOW}说明: 检测到您的服务器已运行 Hysteria 2、3x-ui 或其他 UDP 代理服务并监听了 443 端口。${PLAIN}"
+        echo -e "${YELLOW}为保护现有代理节点正常工作，系统已自动拦截，保持 HTTP/3 关闭状态！${PLAIN}"
+        return 1
+    fi
+
+    return 0
+}
+
 # 核心诊断逻辑: 运行 SSL Doctor
 run_ssl_doctor() {
     local target_domain="$1"
@@ -1596,6 +1785,31 @@ run_ssl_doctor() {
     # 4. 端口 80 / 443 冲突检测
     echo -e "\n${YELLOW}[4/4] Web 核心端口 (80/443) 冲突检测:${PLAIN}"
     check_port_conflicts
+
+    # 4.2 HTTP/3 (QUIC / UDP 443) 专项状态检测
+    echo -e "\n${YELLOW}[4.2] HTTP/3 (QUIC / UDP 443) 状态诊断:${PLAIN}"
+    local udp443_caddy=0
+    local udp443_other=""
+    if command -v ss > /dev/null 2>&1; then
+        local raw_udp
+        raw_udp=$(ss -ulpn '( sport = :443 )' 2>/dev/null)
+        if echo "$raw_udp" | grep -q "caddy"; then
+            udp443_caddy=1
+        fi
+        local non_cad
+        non_cad=$(echo "$raw_udp" | grep -v "caddy" | grep ":443" || true)
+        [ -n "$non_cad" ] && udp443_other="$non_cad"
+    fi
+
+    if [ -n "$udp443_other" ]; then
+        echo -e "  ${YELLOW}● 状态: UDP 443 正在被第三方服务独占 (如 Hysteria 2 / 3x-ui / Xray)${PLAIN}"
+        echo -e "  ${YELLOW}  说明: caddy-pro 智能避让机制已生效，将自动避免开启 HTTP/3 以防节点端口冲突。${PLAIN}"
+    elif [ "$udp443_caddy" -eq 1 ]; then
+        echo -e "  ${GREEN}● 状态: UDP 443 正在由 Caddy 监听 (HTTP/3 极速通道已生效)${PLAIN}"
+    else
+        echo -e "  ${BLUE}● 状态: UDP 443 当前处于空闲状态 (无第三方冲突，可安全开启 HTTP/3)${PLAIN}"
+    fi
+
     if is_cf_dns_active; then
         echo -e "  ${GREEN}ℹ [提示] 当前处于 Cloudflare DNS-01 模式，证书申请与续期完全不依赖 80/443 入站端口连接。${PLAIN}"
     fi
