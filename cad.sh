@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  项目名称: caddy-pro (快捷指令: cad)
-#  版本编号: v3.1.0
+#  版本编号: v3.1.1
 #  版权所有: (c) 2026 DongHua3
 #  开源协议: MIT (SPDX-License-Identifier: MIT)
 #  项目定位: 极简、轻量、高可靠的 Caddy 反向代理交互式管理系统
 #  核心特性: AST深度解析、免Nano原位修改、智能HTTPS上游探测、无损启停、
+#            Cloudflare DNS-01自动化、单实例排他锁、复合路由共存保护、
 #            SSL Doctor网络体检、时光机快照回滚、双模CLI
 # ==============================================================================
 
@@ -17,7 +18,7 @@ CADDY_BAK="${CADDY_BAK:-/etc/caddy/Caddyfile.bak}"
 BACKUP_DIR="${BACKUP_DIR:-/etc/caddy/backups}"
 MAX_BACKUPS="${MAX_BACKUPS:-15}"
 INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/cad}"
-VERSION="3.1.0"
+VERSION="3.1.1"
 
 # 终端色彩定义
 RED='\033[0;31m'
@@ -39,8 +40,35 @@ declare -a RULE_PATH=()
 declare -a RULE_TLS_SKIP=()
 declare -i RULE_TOTAL=0
 
-# 终端退出恢复色彩
-trap 'echo -e "${PLAIN}"' EXIT INT TERM
+CAD_LOCK_FILE="${CAD_LOCK_FILE:-/run/lock/caddy_pro.lock}"
+if [ ! -d "/run/lock" ] && [ -d "/var/lock" ]; then
+    CAD_LOCK_FILE="/var/lock/caddy_pro.lock"
+elif [ ! -d "/run/lock" ] && [ ! -d "/var/lock" ]; then
+    CAD_LOCK_FILE="/tmp/caddy_pro.lock"
+fi
+
+# 终端退出恢复色彩并释放文件锁
+release_lock() {
+    echo -e "${PLAIN}"
+    flock -u 200 2>/dev/null || true
+    rm -f "$CAD_LOCK_FILE" 2>/dev/null || true
+}
+trap release_lock EXIT INT TERM
+
+# 单实例排他锁保护 (防止多终端并发修改造成 Caddyfile 行号错位或覆盖)
+acquire_lock() {
+    local lock_dir
+    lock_dir="$(dirname "$CAD_LOCK_FILE")"
+    [ -d "$lock_dir" ] || mkdir -p "$lock_dir" 2>/dev/null || true
+
+    if command -v flock >/dev/null 2>&1; then
+        exec 200>"$CAD_LOCK_FILE"
+        if ! flock -n 200; then
+            echo -e "${RED}[错误] 检测到已有 caddy-pro (cad) 实例正在运行，请勿并发执行操作！${PLAIN}" >&2
+            exit 1
+        fi
+    fi
+}
 
 # 0. 终端输入重定向保护 (解决 curl | bash 管道执行导致 STDIN 耗尽死循环)
 ensure_tty() {
@@ -212,6 +240,14 @@ init_env() {
     fi
     ensure_caddyfile_perms "$CADDY_FILE"
 
+    # 对存量有效 Caddyfile 执行排版规范化 (消除换行花括号/Tab混排等风格盲区，保障AST精准解析)
+    if command -v caddy >/dev/null 2>&1 && [ -f "$CADDY_FILE" ] && [ -s "$CADDY_FILE" ]; then
+        if caddy validate --config "$CADDY_FILE" >/dev/null 2>&1; then
+            caddy fmt --overwrite "$CADDY_FILE" >/dev/null 2>&1 || true
+            ensure_caddyfile_perms "$CADDY_FILE"
+        fi
+    fi
+
     # 初始化备份配置基线
     if [ ! -s "$CADDY_BAK" ]; then
         cp -f "$CADDY_FILE" "$CADDY_BAK" 2>/dev/null || true
@@ -232,22 +268,40 @@ ensure_caddy_installed() {
     return 0
 }
 
-# 4. 自动注册全局快捷指令 cad (兼顾本地文件与远程管道下载)
+# 4. 自动注册全局快捷指令 cad (兼顾本地文件与远程管道下载，防止复制管道FD生成空文件)
 setup_shortcut() {
     local script_file
-    script_file=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null)
+    script_file=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
     [ -d "/usr/local/bin" ] || mkdir -p /usr/local/bin
 
-    if [ -f "$script_file" ]; then
-        if [ "$script_file" != "$INSTALL_PATH" ]; then
-            cp -f "$script_file" "$INSTALL_PATH"
+    local repo_url="https://raw.githubusercontent.com/DongHua3/caddy-pro/main/cad.sh"
+    # 严格校验：排除 /dev/fd/* 与 /proc/* 管道伪路径，并确保文件大小大于 10KB 才是完整本地脚本
+    if [ -f "$script_file" ] && [ -s "$script_file" ] && [[ "$script_file" != /dev/fd/* && "$script_file" != /proc/* ]]; then
+        local f_sz
+        f_sz=$(wc -c < "$script_file" 2>/dev/null || echo 0)
+        if [ "$f_sz" -gt 10240 ]; then
+            if [ "$script_file" != "$INSTALL_PATH" ]; then
+                cp -f "$script_file" "$INSTALL_PATH"
+                chmod +x "$INSTALL_PATH"
+            fi
+            return 0
+        fi
+    fi
+
+    # 管道模式执行或本地脚本异常，从远端安全下载落盘 (安全校验大小后原子更新)
+    local tmp_inst
+    tmp_inst=$(mktemp /usr/local/bin/.cad_inst.XXXXXX 2>/dev/null || mktemp /tmp/.cad_inst.XXXXXX)
+    if curl -fsSL "$repo_url" -o "$tmp_inst" 2>/dev/null; then
+        local dl_sz
+        dl_sz=$(wc -c < "$tmp_inst" 2>/dev/null || echo 0)
+        if [ "$dl_sz" -gt 10240 ]; then
+            mv -f "$tmp_inst" "$INSTALL_PATH"
             chmod +x "$INSTALL_PATH"
+        else
+            rm -f "$tmp_inst" 2>/dev/null || true
         fi
     else
-        local repo_url="https://raw.githubusercontent.com/DongHua3/caddy-pro/main/cad.sh"
-        if curl -fsSL "$repo_url" -o "$INSTALL_PATH" 2>/dev/null; then
-            chmod +x "$INSTALL_PATH"
-        fi
+        rm -f "$tmp_inst" 2>/dev/null || true
     fi
 }
 
@@ -843,22 +897,26 @@ update_rule_block() {
 
         # Inside block [s+1, e-1]
         if (!in_rp && line ~ /^[ \t]*reverse_proxy/) {
-            in_rp = 1
-            rp_depth = 0
-            if (line ~ /\{[ \t]*$/) {
-                rp_depth = 1
-            }
             if (!rp_replaced) {
+                in_rp = 1
+                rp_depth = 0
+                if (line ~ /\{[ \t]*$/) {
+                    rp_depth = 1
+                }
                 while ((getline rline < rfile) > 0) {
                     if (length(rline) > 0) print_line(rline)
                 }
                 close(rfile)
                 rp_replaced = 1
+                if (rp_depth == 0) {
+                    in_rp = 0
+                }
+                next
+            } else {
+                # 关键保护：站点中存在的后续复合 reverse_proxy 路由指令完整保留，防止被误吞！
+                print_line(line)
+                next
             }
-            if (rp_depth == 0) {
-                in_rp = 0
-            }
-            next
         }
 
         if (in_rp) {
@@ -932,6 +990,27 @@ edit_rule_inplace() {
     local cur_status="${RULE_STATUS[sel_idx]}"
     local start_line="${RULE_START[sel_idx]}"
     local end_line="${RULE_END[sel_idx]}"
+
+    # 检测当前站点块内 reverse_proxy 指令数量 (多路由复合保护)
+    local rp_cnt=0
+    rp_cnt=$(awk -v s="$start_line" -v e="$end_line" '
+        NR >= s && NR <= e {
+            line = $0
+            sub(/^[ \t]*#[ \t]*\[cad:disabled\][ \t]?/, "", line)
+            if (line ~ /^[ \t]*reverse_proxy/) c++
+        }
+        END { print c+0 }
+    ' "$CADDY_FILE" 2>/dev/null || echo 0)
+
+    if [ "$rp_cnt" -gt 1 ]; then
+        echo -e "\n${YELLOW}⚠️  [复合路由提示] 该站点块内检测到 ${rp_cnt} 条 reverse_proxy 反代指令！${PLAIN}"
+        echo -e "${YELLOW}原位修改器将就地更新主反代规则，并自动安全保留其余次级路由。${PLAIN}"
+        echo -e "${YELLOW}若需重构复杂的路由分流逻辑，推荐返回主菜单选择 [9] 手动安全编辑。${PLAIN}"
+        read -p "是否继续就地修改主反代规则? (y/n): " cont_rp
+        if [[ "$cont_rp" != "y" && "$cont_rp" != "Y" ]]; then
+            return
+        fi
+    fi
 
     local modified=0
 
@@ -1330,11 +1409,17 @@ check_port_conflicts() {
                 [[ "$line" =~ :443[[:space:]] ]] && port="443"
 
                 local proc_info="未知进程"
+                local ppid=""
                 if [[ "$line" =~ users:\(\(\"?([^,\"]+)\"?,pid=([0-9]+) ]]; then
                     local pname="${BASH_REMATCH[1]}"
-                    local ppid="${BASH_REMATCH[2]}"
+                    ppid="${BASH_REMATCH[2]}"
                     proc_info="${pname} (PID: ${ppid})"
                     pids+=("$ppid")
+                fi
+                if [ -n "$ppid" ]; then
+                    local cmd_args
+                    cmd_args=$(ps -p "$ppid" -o args= 2>/dev/null | tr -s ' ' | cut -c 1-55)
+                    [ -n "$cmd_args" ] && proc_info="${proc_info} [${cmd_args}]"
                 fi
                 conflicts+=("端口 ${port}: ${proc_info}")
             done <<< "$raw"
@@ -1352,6 +1437,9 @@ check_port_conflicts() {
                 pinfo=$(echo "$line" | awk '{print $7}')
                 local ppid="${pinfo%/*}"
                 [ -n "$ppid" ] && pids+=("$ppid")
+                local cmd_args=""
+                [ -n "$ppid" ] && cmd_args=$(ps -p "$ppid" -o args= 2>/dev/null | tr -s ' ' | cut -c 1-55)
+                [ -n "$cmd_args" ] && pinfo="${pinfo} [${cmd_args}]"
                 conflicts+=("端口 ${port}: ${pinfo}")
             done <<< "$raw"
         fi
@@ -1368,7 +1456,11 @@ check_port_conflicts() {
                 [[ "$line" =~ :80 ]] && port="80"
                 [[ "$line" =~ :443 ]] && port="443"
                 [ -n "$ppid" ] && pids+=("$ppid")
-                conflicts+=("端口 ${port}: ${pname} (PID: ${ppid})")
+                local cmd_args=""
+                [ -n "$ppid" ] && cmd_args=$(ps -p "$ppid" -o args= 2>/dev/null | tr -s ' ' | cut -c 1-55)
+                local desc="${pname} (PID: ${ppid})"
+                [ -n "$cmd_args" ] && desc="${desc} [${cmd_args}]"
+                conflicts+=("端口 ${port}: ${desc}")
             done <<< "$raw"
         fi
     fi
@@ -1381,20 +1473,30 @@ check_port_conflicts() {
         echo -e "${YELLOW}提示: 80/443 端口被占用会导致 Caddy 无法启动或 ACME 证书签发中断！${PLAIN}"
         read -p "是否一键停止冲突服务并释放端口? (y/n): " kill_opt
         if [[ "$kill_opt" == "y" || "$kill_opt" == "Y" ]]; then
-            echo -e "${BLUE}正在停止冲突服务并释放端口...${PLAIN}"
-            systemctl stop nginx 2>/dev/null
-            systemctl disable nginx 2>/dev/null
-            systemctl stop apache2 2>/dev/null
-            systemctl disable apache2 2>/dev/null
-            systemctl stop httpd 2>/dev/null
-            systemctl disable httpd 2>/dev/null
+            echo -e "${BLUE}正在停止冲突系统服务 (Nginx/Apache)...${PLAIN}"
+            systemctl stop nginx 2>/dev/null || true
+            systemctl disable nginx 2>/dev/null || true
+            systemctl stop apache2 2>/dev/null || true
+            systemctl disable apache2 2>/dev/null || true
+            systemctl stop httpd 2>/dev/null || true
+            systemctl disable httpd 2>/dev/null || true
+
+            # 第一阶段: 优雅终止 (SIGTERM)
             for pid in "${pids[@]}"; do
                 if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-                    kill -9 "$pid" 2>/dev/null
+                    kill -15 "$pid" 2>/dev/null || true
                 fi
             done
             sleep 1
-            echo -e "${GREEN}✓ 端口释放操作已执行完毕！${PLAIN}"
+
+            # 第二阶段: 强制清除残留顽固进程 (SIGKILL)
+            for pid in "${pids[@]}"; do
+                if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+            done
+            sleep 0.5
+            echo -e "${GREEN}✓ 端口释放操作已平滑执行完毕！${PLAIN}"
         fi
     else
         echo -e "${GREEN}✓ 端口 80 与 443 状态健康 (未检测到第三方服务冲突)。${PLAIN}"
@@ -2603,6 +2705,7 @@ show_help() {
 main_menu() {
     check_root
     ensure_tty
+    acquire_lock
     init_env
     setup_shortcut
 
@@ -2722,6 +2825,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             ;;
         reload)
             check_root
+            acquire_lock
             init_env
             ensure_caddy_installed || exit 1
             safe_reload
@@ -2735,6 +2839,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             ;;
         backup)
             check_root
+            acquire_lock
             init_env
             create_backup "${2:-CLI手动创建快照}"
             echo -e "${GREEN}✓ 配置快照已成功创建并保存至: ${BACKUP_DIR}${PLAIN}"
@@ -2742,15 +2847,19 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             ;;
         cf)
             check_root
-            init_env
             case "$2" in
                 set)
+                    acquire_lock
+                    init_env
                     cli_cf_set "$3"
                     ;;
                 remove|rm|del)
+                    acquire_lock
+                    init_env
                     cli_cf_remove
                     ;;
                 status|"")
+                    init_env
                     cli_cf_status
                     ;;
                 *)
