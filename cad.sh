@@ -658,10 +658,10 @@ list_rules() {
             p_info="HTTPS (TLS Skip)"
         fi
         if [ "${RULE_AI_OPT[i]}" -eq 1 ]; then
-            p_info="${p_info}+⚡AI流式"
+            p_info="${p_info}+AI流式"
         fi
         if [ "${RULE_H3[i]}" -eq 1 ]; then
-            p_info="${p_info}+🚀H3"
+            p_info="${p_info}+H3"
         fi
 
         local tgt_display="${RULE_TARGET[i]:-(自定义/无代理)}"
@@ -750,8 +750,8 @@ add_rule() {
     if [[ "$probe_err_http" =~ "HTTPS" || "$probe_err_http" =~ "HTTP request to an HTTPS server" || "$probe_err_http" =~ "The plain HTTP request was sent to HTTPS port" ]] || \
        [ -n "$probe_loc_http" ] || \
        { [ "$probe_res_https" != "000" ] && [ "$probe_res_http" == "000" -o "$probe_res_http" == "400" ]; }; then
-        echo -e "${YELLOW}⚡ [智能探测] 检测到上游服务要求 HTTPS 协议 (常见于 3x-ui / 面板服务)！${PLAIN}"
-        echo -e "${YELLOW}⚡ 自动建议: 启用 HTTPS 反代并跳过自签名证书校验，防止 ERR_TOO_MANY_REDIRECTS 循环重定向！${PLAIN}"
+        echo -e "${YELLOW}[智能探测] 检测到上游服务要求 HTTPS 协议 (常见于 3x-ui / 面板服务)！${PLAIN}"
+        echo -e "${YELLOW}自动建议: 启用 HTTPS 反代并跳过自签名证书校验，防止 ERR_TOO_MANY_REDIRECTS 循环重定向！${PLAIN}"
         detected_proto="https"
         detected_tls_skip=1
     elif [ "$probe_res_http" != "000" ]; then
@@ -797,21 +797,21 @@ add_rule() {
     fi
 
     echo -e "\n${BLUE}--- 场景加速与增强预设 (正交可选) ---${PLAIN}"
-    read -p "是否开启 ⚡ AI 大模型流式优化 (防打字机卡顿 + 300s/600s长保活)? (y/n, 默认 n): " do_ai
+    read -p "是否开启 AI 大模型流式优化 (防打字机卡顿 + 300s/600s长保活)? (y/n, 默认 n): " do_ai
     local final_ai_opt=0
     if [[ "$do_ai" == "y" || "$do_ai" == "Y" ]]; then
         final_ai_opt=1
         echo -e "${GREEN}✓ 已选择开启 AI 流式优化模式！${PLAIN}"
     fi
 
-    read -p "是否开启 🚀 HTTP/3 (QUIC / UDP 443) 极速通道? (y/n, 默认 n): " do_h3
+    read -p "是否开启 HTTP/3 (QUIC / UDP 443) 极速通道? (y/n, 默认 n): " do_h3
     local final_h3=0
     if [[ "$do_h3" == "y" || "$do_h3" == "Y" ]]; then
         echo -e "${BLUE}正在检测宿主机 UDP 443 端口状态...${PLAIN}"
         if check_udp_443_conflict; then
             final_h3=1
             echo -e "${GREEN}✓ [安全检测通过] UDP 443 端口无冲突，已开启 HTTP/3！${PLAIN}"
-            echo -e "${BLUE}💡 提示: 请确保云服务商安全组及本机防火墙已放行 UDP 443 端口。${PLAIN}"
+            echo -e "${BLUE}[提示] 请确保云服务商安全组及本机防火墙已放行 UDP 443 端口。${PLAIN}"
         else
             final_h3=0
             echo -e "${YELLOW}提示: 为保障现有服务安全，已自动放弃开启 HTTP/3。${PLAIN}"
@@ -1073,7 +1073,7 @@ edit_rule_inplace() {
     ' "$CADDY_FILE" 2>/dev/null || echo 0)
 
     if [ "$rp_cnt" -gt 1 ]; then
-        echo -e "\n${YELLOW}⚠️  [复合路由提示] 该站点块内检测到 ${rp_cnt} 条 reverse_proxy 反代指令！${PLAIN}"
+        echo -e "\n${YELLOW}[复合路由提示] 该站点块内检测到 ${rp_cnt} 条 reverse_proxy 反代指令！${PLAIN}"
         echo -e "${YELLOW}原位修改器将就地更新主反代规则，并自动安全保留其余次级路由。${PLAIN}"
         echo -e "${YELLOW}若需重构复杂的路由分流逻辑，推荐返回主菜单选择 [9] 手动安全编辑。${PLAIN}"
         read -p "是否继续就地修改主反代规则? (y/n): " cont_rp
@@ -1111,8 +1111,8 @@ edit_rule_inplace() {
         echo -e "  [2] 代理目标 (Target)        : ${BOLD}${cur_target}${PLAIN}"
         echo -e "  [3] 协议与TLS (Protocol/TLS) : ${proto_display}"
         echo -e "  [4] 路径路由 (Path Matcher)  : ${BOLD}${cur_path:-(全部流量)}${PLAIN}"
-        echo -e "  [5] ⚡ AI 流式优化 (SSE/超时) : ${ai_display}"
-        echo -e "  [6] 🚀 HTTP/3 (QUIC / UDP)  : ${h3_display}"
+        echo -e "  [5] AI 流式优化 (SSE/超时)   : ${ai_display}"
+        echo -e "  [6] HTTP/3 (QUIC / UDP 443)  : ${h3_display}"
         echo -e "  [7] 规则状态 (Status)        : ${st_display}"
         echo -e "  [8] 保存修改并应用生效"
         echo -e "  [0] 放弃修改并返回"
@@ -1227,7 +1227,7 @@ edit_rule_inplace() {
                     if check_udp_443_conflict; then
                         cur_h3=1
                         echo -e "\n${GREEN}✓ [安全检测通过] UDP 443 端口无冲突，已开启 HTTP/3 (QUIC)！${PLAIN}"
-                        echo -e "${BLUE}💡 提示: 请确保云服务商安全组与本地防火墙 (ufw/firewalld) 已放行 443/UDP 端口。${PLAIN}"
+                        echo -e "${BLUE}[提示] 请确保云服务商安全组与本地防火墙 (ufw/firewalld) 已放行 443/UDP 端口。${PLAIN}"
                         modified=1
                     else
                         echo -e "${YELLOW}提示: 为保障现有服务安全，已取消开启 HTTP/3。${PLAIN}"
@@ -1574,7 +1574,7 @@ check_port_conflicts() {
     fi
 
     if [ ${#conflicts[@]} -gt 0 ]; then
-        echo -e "${YELLOW}⚠️  检测到以下外部进程正占用 Web 核心端口 (80/443)：${PLAIN}"
+        echo -e "${YELLOW}[警告] 检测到以下外部进程正占用 Web 核心端口 (80/443)：${PLAIN}"
         for c in "${conflicts[@]}"; do
             echo -e "  - ${RED}${c}${PLAIN}"
         done
@@ -1680,7 +1680,7 @@ check_udp_443_conflict() {
     fi
 
     if [ ${#conflicts[@]} -gt 0 ]; then
-        echo -e "\n${YELLOW}⚠️  [端口冲突拦截] 检测到 UDP 443 端口已被第三方进程独占：${PLAIN}"
+        echo -e "\n${YELLOW}[端口冲突拦截] 检测到 UDP 443 端口已被第三方进程独占：${PLAIN}"
         for c in "${conflicts[@]}"; do
             echo -e "  - ${RED}${c}${PLAIN}"
         done
@@ -1739,10 +1739,10 @@ run_ssl_doctor() {
             else
                 echo -e "  ${RED}✗ 域名解析 IP ($dns_v4) 与本机 IP ($server_v4) 不匹配！${PLAIN}"
                 if is_cf_dns_active; then
-                    echo -e "  ${GREEN}⚡ [DNS-01 引擎生效中] 检测到已激活 Cloudflare DNS-01 验证！即使域名解析至中转机/NAT小鸡，证书亦可通过 DNS TXT 记录直签，无需直连本机！${PLAIN}"
+                    echo -e "  ${GREEN}[DNS-01 引擎生效中] 检测到已激活 Cloudflare DNS-01 验证！即使域名解析至中转机/NAT小鸡，证书亦可通过 DNS TXT 记录直签，无需直连本机！${PLAIN}"
                 else
                     echo -e "  ${YELLOW}建议: 请检查 DNS 服务商控制台的 A 记录设置，或等待 DNS 缓存生效。${PLAIN}"
-                    echo -e "  ${BLUE}💡 若这是中转机/NAT小鸡架构，推荐进入「菜单 6」开启 Cloudflare DNS-01 验证，彻底解除 IP 必须直连本机的限制！${PLAIN}"
+                    echo -e "  ${BLUE}[提示] 若这是中转机/NAT小鸡架构，推荐进入「菜单 6」开启 Cloudflare DNS-01 验证，彻底解除 IP 必须直连本机的限制！${PLAIN}"
                 fi
             fi
         else
@@ -1763,7 +1763,7 @@ run_ssl_doctor() {
         [ -n "$cf_hdr" ] && is_cf=1
 
         if [ "$is_cf" -eq 1 ]; then
-            echo -e "  ${YELLOW}⚠️  检测到该域名开启了 Cloudflare 小黄云 (CDN 代理模式)！${PLAIN}"
+            echo -e "  ${YELLOW}[提示] 检测到该域名开启了 Cloudflare 小黄云 (CDN 代理模式)！${PLAIN}"
             if is_cf_dns_active; then
                 echo -e "  ${GREEN}✓ [DNS-01 引擎已就绪] 已检测到生效中的 Cloudflare DNS-01 验证！${PLAIN}"
                 echo -e "  ${GREEN}  即便开启小黄云代理模式，亦可无视边缘拦截正常完成证书签发与自动续期，无需切为灰色云朵！${PLAIN}"
@@ -2268,7 +2268,7 @@ configure_cf_dns_token() {
     echo -e "${BLUE}================================================================${PLAIN}"
 
     if ! has_cf_dns_module; then
-        echo -e "${YELLOW}⚠️  检测到当前 Caddy 尚未集成 Cloudflare DNS 模块！${PLAIN}"
+        echo -e "${YELLOW}[提示] 检测到当前 Caddy 尚未集成 Cloudflare DNS 模块！${PLAIN}"
         echo -e "启用 DNS-01 验证前，必须使用包含 dns.providers.cloudflare 的增强版程序。"
         read -p "是否立即自动下载并升级为 Cloudflare 增强版 Caddy? (y/n): " do_install_cf
         if [[ "$do_install_cf" == "y" || "$do_install_cf" == "Y" ]]; then
@@ -2316,8 +2316,8 @@ configure_cf_dns_token() {
         ensure_caddyfile_perms "$CADDY_FILE"
         if safe_reload; then
             echo -e "\n${GREEN}✓ Cloudflare DNS-01 验证引擎已成功激活并平滑生效！${PLAIN}"
-            echo -e "${BLUE}💡 所有通过 Caddy 管理的站点在申请/续期证书时，将全自动通过 Cloudflare DNS 验证。${PLAIN}"
-            echo -e "${BLUE}💡 无需开放 80/443 入站端口，彻底穿透 Cloudflare 小黄云代理与 NAT 限制！${PLAIN}"
+            echo -e "${BLUE}[提示] 所有通过 Caddy 管理的站点在申请/续期证书时，将全自动通过 Cloudflare DNS 验证。${PLAIN}"
+            echo -e "${BLUE}[提示] 无需开放 80/443 入站端口，彻底穿透 Cloudflare 小黄云代理与 NAT 限制！${PLAIN}"
         else
             echo -e "\n${RED}✗ 配置重载失败，已自动回滚。请检查 Token 是否有效或语法是否合规！${PLAIN}"
         fi
