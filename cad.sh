@@ -2943,6 +2943,7 @@ uninstall_caddy_pro() {
             echo -e "${BLUE}[4/5] 正在清理配置与系统残留...${PLAIN}"
             rm -f /usr/bin/caddy /usr/bin/caddy.standard_bak /usr/local/bin/caddy 2>/dev/null || true
             rm -rf /etc/caddy 2>/dev/null || true
+            rm -rf /etc/systemd/system/caddy.service /etc/systemd/system/caddy.service.d 2>/dev/null || true
             systemctl daemon-reload 2>/dev/null || true
 
             # 5. 移除 cad 管理脚本自身并释放锁
@@ -3003,6 +3004,7 @@ uninstall_caddy_pro() {
             rm -rf /var/lib/caddy 2>/dev/null || true
             rm -rf /root/.local/share/caddy 2>/dev/null || true
             rm -f /usr/bin/caddy /usr/bin/caddy.standard_bak /usr/local/bin/caddy 2>/dev/null || true
+            rm -rf /etc/systemd/system/caddy.service /etc/systemd/system/caddy.service.d 2>/dev/null || true
             systemctl daemon-reload 2>/dev/null || true
 
             echo -e "${RED}[4/4] 正在移除管理工具并清除所有文件排他锁...${PLAIN}"
@@ -3122,18 +3124,18 @@ main_menu() {
         echo -e "${GREEN}${BOLD}           caddy-pro 反向代理交互式管理系统 (v${VERSION})            ${PLAIN}"
         echo -e "       极简、安全、高可靠 | 快捷唤醒指令: ${GREEN}${BOLD}cad${PLAIN}"
         echo -e "${BLUE}================================================================${PLAIN}"
-        echo -e "  ${GREEN}1.${PLAIN} 查看当前所有反代规则列表"
-        echo -e "  ${GREEN}2.${PLAIN} 添加反代规则 (智能探测/支持HTTPS后端)"
-        echo -e "  ${GREEN}3.${PLAIN} 交互式修改反代规则 (免开Nano/原位修改)"
-        echo -e "  ${GREEN}4.${PLAIN} 启用 / 停用反代规则 (无损状态切换)"
-        echo -e "  ${GREEN}5.${PLAIN} 删除已有反代规则"
+        echo -e "  ${GREEN}1.${PLAIN} 查看当前所有反代规则列表 (含 AI流式 与 H3 标识)"
+        echo -e "  ${GREEN}2.${PLAIN} 添加反代规则 (智能探测/HTTPS后端/AI流式/安全H3)"
+        echo -e "  ${GREEN}3.${PLAIN} 交互式修改反代规则 (免开Nano/原位修改/复合路由保护)"
+        echo -e "  ${GREEN}4.${PLAIN} 启用 / 停用反代规则 (无损状态切换/保留自定义块)"
+        echo -e "  ${GREEN}5.${PLAIN} 删除已有反代规则 (带非空防灾校验)"
         echo -e "  ${GREEN}6.${PLAIN} SSL 证书中心 & DNS-01 自动化 (SSL Doctor/Cloudflare)"
-        echo -e "  ${GREEN}7.${PLAIN} 快照时光机与安全回滚 (保留15个版本/Diff对比)"
-        echo -e "  ${GREEN}8.${PLAIN} 检查配置并平滑重载 Caddy (免重启生效)"
-        echo -e "  ${GREEN}9.${PLAIN} 手动编辑 Caddyfile 配置文件 (安全预检+草稿保护)"
-        echo -e " ${GREEN}10.${PLAIN} 查看 Caddy 运行状态与证书日志"
+        echo -e "  ${GREEN}7.${PLAIN} 快照时光机与安全回滚 (保留15个版本/彩色Diff对比)"
+        echo -e "  ${GREEN}8.${PLAIN} 检查配置并平滑重载 Caddy (免重启生效/带预检)"
+        echo -e "  ${GREEN}9.${PLAIN} 手动编辑 Caddyfile 配置文件 (安全预检+草稿自动保护)"
+        echo -e " ${GREEN}10.${PLAIN} 查看 Caddy 运行状态与证书日志 (实时追踪最新40行)"
         echo -e " ${GREEN}11.${PLAIN} 服务运维控制 (重载 / 重启 / 停止 / 启动)"
-        echo -e " ${GREEN}12.${PLAIN} 一键安装 / 更新 Caddy 环境"
+        echo -e " ${GREEN}12.${PLAIN} 一键安装 / 更新 Caddy 环境 (官方标准版 / CF增强版)"
         echo -e " ${GREEN}13.${PLAIN} 一键卸载与环境清理 (三模式: 仅脚本 / 归档卸载 / 强力粉碎)"
         echo -e "  ${GREEN}0.${PLAIN} 退出管理系统"
         echo -e "${BLUE}================================================================${PLAIN}"
