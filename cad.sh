@@ -2837,6 +2837,198 @@ install_caddy() {
     esac
 }
 
+# 菜单 13: caddy-pro (cad) 一键卸载与环境清理系统 (三模式)
+uninstall_caddy_pro() {
+    local cli_mode="$1"
+
+    local un_opt=""
+    if [ "$cli_mode" == "--script-only" ] || [ "$cli_mode" == "-s" ]; then
+        un_opt="1"
+    elif [ "$cli_mode" == "--archive" ] || [ "$cli_mode" == "-a" ]; then
+        un_opt="2"
+    elif [ "$cli_mode" == "--purge" ] || [ "$cli_mode" == "-p" ]; then
+        un_opt="3"
+    fi
+
+    if [ -z "$un_opt" ]; then
+        clear
+        echo -e "${BLUE}================================================================${PLAIN}"
+        echo -e "${RED}${BOLD}             caddy-pro (cad) 一键卸载与环境清理系统             ${PLAIN}"
+        echo -e "${BLUE}================================================================${PLAIN}"
+        echo -e "请选择卸载模式："
+        echo -e "  ${GREEN}1.${PLAIN} 仅卸载 cad 运维管理脚本 (轻量脱钩)"
+        echo -e "     ${YELLOW}说明: 仅删除快捷指令，Caddy 服务与所有反代业务 100% 保持正常运行${PLAIN}\n"
+        echo -e "  ${YELLOW}2.${PLAIN} 完全卸载并安全打包归档 (推荐安全模式)"
+        echo -e "     ${YELLOW}说明: 自动将 /etc/caddy 与证书打包至 /root/ 归档备份，再安全卸载${PLAIN}\n"
+        echo -e "  ${RED}3.${PLAIN} 纯净强力彻底擦除 (连根拔起 / 开发者重置模式)"
+        echo -e "     ${YELLOW}说明: 停止服务、卸载软件、物理粉碎所有配置与证书，0 任何数据残留${PLAIN}\n"
+        echo -e "  ${GREEN}0.${PLAIN} 取消并返回主菜单"
+        echo -e "${BLUE}================================================================${PLAIN}"
+        read -p "请输入选项编号 [0-3]: " un_opt
+    fi
+
+    case "$un_opt" in
+        1)
+            echo -e "\n${BLUE}正在执行模式 1: 仅卸载 cad 运维管理脚本...${PLAIN}"
+            read -p "确认仅移除 cad 快捷指令吗? (y/n): " confirm_un1
+            if [[ "$confirm_un1" != "y" && "$confirm_un1" != "Y" ]]; then
+                echo -e "${YELLOW}操作已取消。${PLAIN}"
+                pause
+                return 0
+            fi
+
+            echo -e "${BLUE}正在释放文件排他锁并清理快捷方式...${PLAIN}"
+            local cad_bin="${INSTALL_PATH:-/usr/local/bin/cad}"
+            rm -f "$cad_bin" 2>/dev/null || true
+            if [ -n "$0" ] && [ "$0" != "$cad_bin" ] && [ -f "$0" ] && [[ "$0" != /dev/fd/* && "$0" != /proc/* ]]; then
+                rm -f "$0" 2>/dev/null || true
+            fi
+            release_lock
+            echo -e "\n${GREEN}✓ 已成功移除 cad 快捷指令与管理脚本！${PLAIN}"
+            echo -e "${GREEN}✓ Caddy 守护进程当前仍在后台正常运行，您的所有域名反代与 SSL 证书未受任何影响！${PLAIN}"
+            echo -e "${BLUE}[提示] 以后您可直接使用 systemctl reload caddy 或直接编辑 /etc/caddy/Caddyfile 进行管理。${PLAIN}"
+            exit 0
+            ;;
+        2)
+            echo -e "\n${YELLOW}=== 模式 2: 完全卸载并安全打包归档 ===${PLAIN}"
+            echo -e "${YELLOW}警告: 此操作将停止 Caddy 服务并卸载 Caddy 软件包，域名反代将暂停服务！${PLAIN}"
+            read -p "确认继续执行卸载与归档操作吗? (y/n): " confirm_un2
+            if [[ "$confirm_un2" != "y" && "$confirm_un2" != "Y" ]]; then
+                echo -e "${YELLOW}操作已取消。${PLAIN}"
+                pause
+                return 0
+            fi
+
+            # 1. 自动打包装箱备份
+            local ts
+            ts=$(date +"%Y%m%d_%H%M%S")
+            local archive_file="/root/caddy_backup_${ts}.tar.gz"
+            echo -e "\n${BLUE}[1/5] 正在打包归档现有 Caddyfile 配置、历史快照库与证书数据...${PLAIN}"
+            local backup_targets=()
+            [ -d "/etc/caddy" ] && backup_targets+=("etc/caddy")
+            [ -d "/var/lib/caddy" ] && backup_targets+=("var/lib/caddy")
+            [ -d "/root/.local/share/caddy" ] && backup_targets+=("root/.local/share/caddy")
+
+            if [ ${#backup_targets[@]} -gt 0 ]; then
+                tar -czf "$archive_file" -C / "${backup_targets[@]}" 2>/dev/null || tar -czf "$archive_file" /etc/caddy 2>/dev/null || true
+                if [ -s "$archive_file" ]; then
+                    echo -e "${GREEN}✓ 核心数据已成功安全归档打包至: ${archive_file}${PLAIN}"
+                else
+                    echo -e "${YELLOW}未能生成打包归档文件，继续执行卸载...${PLAIN}"
+                fi
+            fi
+
+            # 2. 优雅停止并禁用服务
+            echo -e "${BLUE}[2/5] 正在停止并禁用 Caddy systemd 服务...${PLAIN}"
+            systemctl stop caddy 2>/dev/null || true
+            systemctl disable caddy 2>/dev/null || true
+
+            # 3. 恢复包管理器状态 (解锁 apt-mark hold) 并调用官方卸载
+            echo -e "${BLUE}[3/5] 正在从系统软件包管理器中卸载 Caddy...${PLAIN}"
+            if command -v apt-mark >/dev/null 2>&1; then
+                apt-mark unhold caddy >/dev/null 2>&1 || true
+            fi
+            if [ -f /etc/debian_version ]; then
+                apt purge -y caddy >/dev/null 2>&1 || apt remove -y caddy >/dev/null 2>&1 || true
+                rm -f /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null || true
+                rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null || true
+            elif [ -f /etc/redhat-release ]; then
+                (dnf remove -y caddy 2>/dev/null || yum remove -y caddy 2>/dev/null) || true
+                dnf copr disable -y @caddy/caddy 2>/dev/null || true
+            elif [ -f /etc/alpine-release ]; then
+                apk del caddy >/dev/null 2>&1 || true
+            fi
+
+            # 4. 底层残留清理 (物理清理增强版二进制与配置)
+            echo -e "${BLUE}[4/5] 正在清理配置与系统残留...${PLAIN}"
+            rm -f /usr/bin/caddy /usr/bin/caddy.standard_bak /usr/local/bin/caddy 2>/dev/null || true
+            rm -rf /etc/caddy 2>/dev/null || true
+            systemctl daemon-reload 2>/dev/null || true
+
+            # 5. 移除 cad 管理脚本自身并释放锁
+            echo -e "${BLUE}[5/5] 正在清理管理工具与锁文件...${PLAIN}"
+            local cad_bin="${INSTALL_PATH:-/usr/local/bin/cad}"
+            rm -f "$cad_bin" 2>/dev/null || true
+            if [ -n "$0" ] && [ "$0" != "$cad_bin" ] && [ -f "$0" ] && [[ "$0" != /dev/fd/* && "$0" != /proc/* ]]; then
+                rm -f "$0" 2>/dev/null || true
+            fi
+            release_lock
+
+            echo -e "\n${GREEN}================================================================${PLAIN}"
+            echo -e "${GREEN}${BOLD}✓ Caddy 环境与 caddy-pro 已成功完全卸载！${PLAIN}"
+            if [ -s "$archive_file" ]; then
+                echo -e "${YELLOW}您的全量配置与证书已完整归档保存于: ${BOLD}${archive_file}${PLAIN}"
+                echo -e "   (以后若需恢复，解压至系统根目录即可复原所有站点配置)"
+            fi
+            echo -e "${GREEN}================================================================${PLAIN}"
+            exit 0
+            ;;
+        3)
+            echo -e "\n${RED}================================================================${PLAIN}"
+            echo -e "${RED}${BOLD}     高危警告: 模式 3 纯净强力彻底擦除 (开发者重置模式)      ${PLAIN}"
+            echo -e "${RED}================================================================${PLAIN}"
+            echo -e "${RED}此操作将永久物理删除所有站点配置、时光机快照与 SSL 证书！${PLAIN}"
+            echo -e "${RED}系统将【绝不保留任何归档备份】，彻底恢复为从没装过 Caddy 的原始状态！${PLAIN}"
+            echo -e "${YELLOW}请输入大写字母 ${BOLD}PURGE${PLAIN}${YELLOW} 以确认执行彻底擦除 (输入其他任何内容取消): ${PLAIN}"
+            read -p "> " confirm_purge
+
+            if [ "$confirm_purge" != "PURGE" ]; then
+                echo -e "${YELLOW}输入不匹配，强力擦除已安全取消。${PLAIN}"
+                pause
+                return 0
+            fi
+
+            echo -e "\n${RED}[1/4] 正在强制停止 Caddy 并回收 80/443 Web 端口...${PLAIN}"
+            systemctl stop caddy 2>/dev/null || true
+            systemctl disable caddy 2>/dev/null || true
+            pkill -9 -x caddy 2>/dev/null || true
+
+            echo -e "${RED}[2/4] 正在从系统软件源彻底根除 Caddy 软件包并移除官方源...${PLAIN}"
+            if command -v apt-mark >/dev/null 2>&1; then
+                apt-mark unhold caddy >/dev/null 2>&1 || true
+            fi
+            if [ -f /etc/debian_version ]; then
+                apt purge -y caddy >/dev/null 2>&1 || apt remove -y caddy >/dev/null 2>&1 || true
+                rm -f /etc/apt/sources.list.d/caddy-stable.list 2>/dev/null || true
+                rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null || true
+            elif [ -f /etc/redhat-release ]; then
+                (dnf remove -y caddy 2>/dev/null || yum remove -y caddy 2>/dev/null) || true
+                dnf copr disable -y @caddy/caddy 2>/dev/null || true
+            elif [ -f /etc/alpine-release ]; then
+                apk del caddy >/dev/null 2>&1 || true
+            fi
+
+            echo -e "${RED}[3/4] 正在物理粉碎所有配置目录、历史快照库、SSL 证书库与二进制...${PLAIN}"
+            rm -rf /etc/caddy 2>/dev/null || true
+            rm -rf /var/lib/caddy 2>/dev/null || true
+            rm -rf /root/.local/share/caddy 2>/dev/null || true
+            rm -f /usr/bin/caddy /usr/bin/caddy.standard_bak /usr/local/bin/caddy 2>/dev/null || true
+            systemctl daemon-reload 2>/dev/null || true
+
+            echo -e "${RED}[4/4] 正在移除管理工具并清除所有文件排他锁...${PLAIN}"
+            local cad_bin="${INSTALL_PATH:-/usr/local/bin/cad}"
+            rm -f "$cad_bin" 2>/dev/null || true
+            if [ -n "$0" ] && [ "$0" != "$cad_bin" ] && [ -f "$0" ] && [[ "$0" != /dev/fd/* && "$0" != /proc/* ]]; then
+                rm -f "$0" 2>/dev/null || true
+            fi
+            release_lock
+            rm -f /run/lock/caddy_pro.lock /var/lock/caddy_pro.lock /tmp/caddy_pro.lock 2>/dev/null || true
+
+            echo -e "\n${GREEN}================================================================${PLAIN}"
+            echo -e "${GREEN}${BOLD}✓ 强力彻底擦除已完成！系统已恢复出厂最纯净状态 (0 字节残留)。${PLAIN}"
+            echo -e "${GREEN}================================================================${PLAIN}"
+            exit 0
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            echo -e "${RED}无效选项！${PLAIN}"
+            pause
+            ;;
+    esac
+}
+
 # CLI 模式: 状态输出
 cli_status() {
     echo -e "${BLUE}======================== Caddy 运行状态报告 ========================${PLAIN}"
@@ -2911,6 +3103,7 @@ show_help() {
     echo -e "  cad cf status        查看 Cloudflare DNS-01 模块与 Token 状态"
     echo -e "  cad cf set <token>   配置 Cloudflare API Token 并开启 DNS-01"
     echo -e "  cad cf remove        移除 Cloudflare DNS-01 配置 (切回 HTTP-01)"
+    echo -e "  cad uninstall        一键卸载系统 (支持仅卸载脚本/归档完全卸载/彻底粉碎)"
     echo -e "  cad -v, --version    查看版本信息"
     echo -e "  cad -h, --help       查看帮助信息"
 }
@@ -2941,6 +3134,7 @@ main_menu() {
         echo -e " ${GREEN}10.${PLAIN} 查看 Caddy 运行状态与证书日志"
         echo -e " ${GREEN}11.${PLAIN} 服务运维控制 (重载 / 重启 / 停止 / 启动)"
         echo -e " ${GREEN}12.${PLAIN} 一键安装 / 更新 Caddy 环境"
+        echo -e " ${GREEN}13.${PLAIN} 一键卸载与环境清理 (三模式: 仅脚本 / 归档卸载 / 强力粉碎)"
         echo -e "  ${GREEN}0.${PLAIN} 退出管理系统"
         echo -e "${BLUE}================================================================${PLAIN}"
 
@@ -2970,7 +3164,7 @@ main_menu() {
         echo -e "服务状态: ${svc_status} | 规则统计: ${GREEN}${active_rules} 启用${PLAIN}, ${YELLOW}${disabled_rules} 停用${PLAIN} | ACME: ${acme_summary}"
         echo -e "${BLUE}----------------------------------------------------------------${PLAIN}"
 
-        read -p "请输入功能编号 [0-12]: " num
+        read -p "请输入功能编号 [0-13]: " num
         case $num in
             1)
                 list_rules
@@ -3009,6 +3203,9 @@ main_menu() {
                 ;;
             12)
                 install_caddy
+                ;;
+            13)
+                uninstall_caddy_pro
                 ;;
             0)
                 clear
@@ -3086,6 +3283,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             ;;
         help|--help|-h)
             show_help
+            exit 0
+            ;;
+        uninstall)
+            check_root
+            acquire_lock
+            shift
+            uninstall_caddy_pro "$@"
             exit 0
             ;;
         version|--version|-v)
